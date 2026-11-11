@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 4;
-const APP_VERSION = '10';
+const APP_VERSION = '11';
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
@@ -43,10 +43,14 @@ function haversine(a, b) {
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
-function setStatus(msg, isError = false) {
+let statusTimer = null;
+function setStatus(msg, isError = false, keep = false) {
   const el = $('status');
   el.textContent = msg || '';
   el.classList.toggle('error', !!isError);
+  // i messaggi di conferma spariscono da soli dopo qualche secondo, per tenere pulito il pannello
+  clearTimeout(statusTimer);
+  if (msg && !isError && !keep && !msg.endsWith('…')) statusTimer = setTimeout(() => { el.textContent = ''; }, 6000);
 }
 
 function fmtKm(km) {
@@ -677,7 +681,7 @@ $('recFar').addEventListener('click', () => {
 });
 
 function pickHome() {
-  setStatus('Tocca la mappa nel punto in cui si trova casa tua.');
+  setStatus('Tocca la mappa nel punto in cui si trova casa tua.', false, true);
   document.body.classList.add('picking');
   if (window.innerWidth <= 600) $('panel').classList.add('collapsed');
   map.once('click', (e) => {
@@ -991,7 +995,8 @@ $('sync').addEventListener('click', syncDrive);
   await reloadFromDb(true);
   // sul telefono il pannello parte chiuso, così si vede la mappa
   if (allSegments.length && window.innerWidth <= 600) $('panel').classList.add('collapsed');
-  if (!allSegments.length) setStatus('Accedi a Google Drive oppure trascina qui i tuoi file GPX.');
+  if (!allSegments.length) $('settings').open = true; // primo avvio: mostra subito i pulsanti
+  if (!allSegments.length) setStatus('Accedi a Google Drive oppure trascina qui i tuoi file GPX.', false, true);
   if (token) {
     $('sync').textContent = 'Sincronizza Drive';
     // sessione ancora valida: sincronizza da solo quando la libreria Google è pronta

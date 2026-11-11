@@ -83,7 +83,7 @@ select, input[type="text"] {
 body.picking .leaflet-container { cursor: crosshair; }
 .rec-icon { font-size: 22px; line-height: 30px; text-align: center; filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.8)); }
 
-.actions { display: grid; grid-template-columns: 1fr; gap: 6px; }
+.actions { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 12px; }
 
 button, .btn {
   display: inline-flex;
@@ -104,6 +104,7 @@ button.primary:hover { background: #ff9c48; }
 button.danger { color: var(--danger); width: 100%; margin-top: 8px; }
 button.icon { background: none; border: none; padding: 4px 6px; font-size: 16px; transition: transform 0.15s; }
 
+#status:empty { display: none; }
 #status { margin: 0; min-height: 1.4em; color: var(--muted); font-size: 13px; }
 #status.error { color: var(--danger); }
 
