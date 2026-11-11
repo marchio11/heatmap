@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 4;
-const APP_VERSION = '11';
+const APP_VERSION = '12';
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
