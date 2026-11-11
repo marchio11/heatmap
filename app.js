@@ -12,6 +12,8 @@ const CONFIG = {
   fallbackFolders: ['GPSLogger for Android'],
 };
 
+// Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
+const PARSE_VERSION = 2;
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
@@ -102,31 +104,26 @@ function parseGpx(text) {
   const doc = new DOMParser().parseFromString(text, 'application/xml');
   if (doc.getElementsByTagName('parsererror').length) throw new Error('GPX non valido');
 
-  const segments = [];
-  const trksegs = doc.getElementsByTagName('trkseg');
-  const groups = trksegs.length ? Array.from(trksegs) : [doc];
-
-  for (const g of groups) {
-    const pts = [];
-    for (const el of g.getElementsByTagName('trkpt')) {
-      const lat = parseFloat(el.getAttribute('lat'));
-      const lon = parseFloat(el.getAttribute('lon'));
-      if (!isFinite(lat) || !isFinite(lon)) continue;
-      const timeEl = el.getElementsByTagName('time')[0];
-      const eleEl = el.getElementsByTagName('ele')[0];
-      const t = timeEl ? Date.parse(timeEl.textContent) : NaN;
-      const ele = eleEl ? parseFloat(eleEl.textContent) : NaN;
-      pts.push([
-        Math.round(lat * 1e6) / 1e6,
-        Math.round(lon * 1e6) / 1e6,
-        isFinite(t) ? t : null,
-        isFinite(ele) ? Math.round(ele * 10) / 10 : null,
-      ]);
-    }
-    if (pts.length && pts.every((p) => p[2] !== null)) pts.sort((a, b) => a[2] - b[2]);
-    segments.push(...splitSegment(pts));
+  // GPSLogger apre un nuovo <trkseg> a ogni riavvio della registrazione: uniamo tutti i punti
+  // e lasciamo decidere le interruzioni a splitSegment (pause lunghe o salti del GPS)
+  const pts = [];
+  for (const el of doc.getElementsByTagName('trkpt')) {
+    const lat = parseFloat(el.getAttribute('lat'));
+    const lon = parseFloat(el.getAttribute('lon'));
+    if (!isFinite(lat) || !isFinite(lon)) continue;
+    const timeEl = el.getElementsByTagName('time')[0];
+    const eleEl = el.getElementsByTagName('ele')[0];
+    const t = timeEl ? Date.parse(timeEl.textContent) : NaN;
+    const ele = eleEl ? parseFloat(eleEl.textContent) : NaN;
+    pts.push([
+      Math.round(lat * 1e6) / 1e6,
+      Math.round(lon * 1e6) / 1e6,
+      isFinite(t) ? t : null,
+      isFinite(ele) ? Math.round(ele * 10) / 10 : null,
+    ]);
   }
-  return segments;
+  if (pts.length && pts.every((p) => p[2] !== null)) pts.sort((a, b) => a[2] - b[2]);
+  return splitSegment(pts);
 }
 
 // Divide la traccia dove ci sono pause lunghe o salti impossibili del GPS.
@@ -207,9 +204,11 @@ function pathLength(pts, i0 = 0, i1 = pts.length - 1) {
 // Server pubblico e gratuito di OSRM (motore di navigazione basato su OpenStreetMap).
 // Riceve solo le coordinate dei tratti in veicolo, una volta sola: il risultato resta nel browser.
 const OSRM_URL = 'https://router.project-osrm.org/match/v1/driving/';
-const MATCH_VERSION = 1;
+const MATCH_VERSION = 2;
 const MATCH_CHUNK = 90;   // il server accetta al massimo 100 punti per richiesta
-const MATCH_RADIUS = 35;  // metri di tolleranza intorno a ogni punto GPS
+// metri di tolleranza intorno a ogni punto GPS: se un punto è troppo lontano da strade percorribili
+// in auto (parcheggi o strade private) il server rifiuta tutto, quindi si riprova allargando
+const MATCH_RADII = [35, 70, 100];
 
 const snapEnabled = () => store.get('snap', '1') === '1';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -218,12 +217,21 @@ async function matchChunk(chunk) {
   // i tempi devono essere strettamente crescenti
   const pts = chunk.filter((p, i) => i === 0 || p[2] === null || chunk[i - 1][2] === null || p[2] - chunk[i - 1][2] >= 1000);
   if (pts.length < 2) return null;
+  for (let k = 0; k < MATCH_RADII.length; k++) {
+    if (k) await sleep(1100);
+    const r = await osrmMatch(pts, MATCH_RADII[k]);
+    if (r !== 'retry') return r;
+  }
+  return null;
+}
+
+async function osrmMatch(pts, radius) {
   const params = new URLSearchParams({
     overview: 'full',
     geometries: 'geojson',
     gaps: 'ignore',
     tidy: 'true',
-    radiuses: pts.map(() => MATCH_RADIUS).join(';'),
+    radiuses: pts.map(() => radius).join(';'),
   });
   if (pts.every((p) => p[2] !== null)) params.set('timestamps', pts.map((p) => Math.round(p[2] / 1000)).join(';'));
   const url = OSRM_URL + pts.map((p) => `${p[1].toFixed(6)},${p[0].toFixed(6)}`).join(';') + '?' + params;
@@ -242,7 +250,8 @@ async function matchChunk(chunk) {
     if (dist > 2 * pathLength(pts) + 500) return null;
     return coords;
   }
-  if (json && /^(NoMatch|NoSegment|TooBig|InvalidInput|InvalidValue)$/.test(json.code)) return null;
+  if (json && json.code === 'NoSegment') return 'retry';
+  if (json && /^(NoMatch|TooBig|InvalidInput|InvalidValue)$/.test(json.code)) return null;
   throw new Error('Server delle strade non disponibile');
 }
 
@@ -585,7 +594,6 @@ function renderRecords() {
     L.marker(home, { icon: emojiIcon('🏠'), keyboard: false }).bindTooltip('Casa').addTo(recLayer);
   }
   if (far && far.d > 200) {
-    L.polyline([home, [far.p[0], far.p[1]]], { color: '#7fd3ff', weight: 1.5, opacity: 0.8, dashArray: '6 6', interactive: false }).addTo(recLayer);
     L.marker([far.p[0], far.p[1]], { icon: emojiIcon('📍') })
       .bindTooltip(`Il punto più lontano da casa: ${fmtKm(far.d / 1000)}<br>${fmtDay(far.day)}`).addTo(recLayer);
   }
@@ -860,7 +868,7 @@ async function syncDrive() {
     const known = new Map((await DB.all()).map((r) => [r.name, r]));
     const todo = files.filter((f) => {
       const r = known.get(f.name);
-      return !r || r.source !== 'drive' || r.modifiedTime !== f.modifiedTime;
+      return !r || r.source !== 'drive' || r.modifiedTime !== f.modifiedTime || r.pv !== PARSE_VERSION;
     });
 
     let done = 0, bad = 0;
@@ -869,7 +877,7 @@ async function syncDrive() {
         const f = todo.shift();
         try {
           const text = await drive('files/' + f.id, { alt: 'media' }, true);
-          await DB.put({ name: f.name, source: 'drive', modifiedTime: f.modifiedTime, segments: parseGpx(text) });
+          await DB.put({ name: f.name, source: 'drive', modifiedTime: f.modifiedTime, pv: PARSE_VERSION, segments: parseGpx(text) });
         } catch (err) {
           if (/Sessione Google scaduta/.test(err.message)) throw err;
           bad++;
