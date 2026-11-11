@@ -13,13 +13,15 @@ const CONFIG = {
 };
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
-const PARSE_VERSION = 3;
-const APP_VERSION = '8';
+const PARSE_VERSION = 4;
+const APP_VERSION = '9';
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
 const BRIDGE_MAX_S = 30 * 60; // ...ma un "silenzio" fino a 30 minuti percorso a velocità da veicolo
 const BRIDGE_MIN_M = 1000;    // (gallerie, GPS assente) viene collegato e poi agganciato alla strada
+const PARK_MAX_M = 500;       // sosta con l'auto: se prima e dopo ci si muoveva in veicolo e si riparte
+const PARK_MAX_S = 12 * 3600; // a meno di 500 m da dove ci si era fermati, i punti restano collegati
 // Piedi / veicolo
 const VEHICLE_KMH = 25;       // sopra questa velocità "di punta" è un veicolo
 const MODE_WINDOW_MS = 3 * 60 * 1000; // finestra di ±3 minuti per decidere
@@ -132,17 +134,35 @@ function parseGpx(text) {
 // Divide la traccia dove ci sono pause lunghe o salti impossibili del GPS.
 // Eccezione: se durante una pausa lunga ci si è spostati di almeno 1 km a velocità media
 // da veicolo (es. una galleria lunga), i due punti restano collegati.
+// Velocità massima nei (fino a) 3 tratti prima (dir -1) o dopo (dir +1) il punto i
+function nearbySpeed(pts, i, dir) {
+  let best = 0;
+  for (let k = 0; k < 3; k++) {
+    const a = dir < 0 ? i - k - 1 : i + k;
+    const b = a + 1;
+    if (a < 0 || b >= pts.length || pts[a][2] === null || pts[b][2] === null) break;
+    const dt = (pts[b][2] - pts[a][2]) / 1000;
+    if (!(dt > 0) || dt > GAP_SPLIT_S) break;
+    const kmh = haversine(pts[a], pts[b]) / dt * 3.6;
+    if (kmh <= MAX_JUMP_KMH) best = Math.max(best, kmh);
+  }
+  return best;
+}
+
 function splitSegment(pts) {
   const out = [];
   let cur = [];
-  for (const p of pts) {
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
     const prev = cur[cur.length - 1];
     if (prev && p[2] !== null && prev[2] !== null) {
       const dt = (p[2] - prev[2]) / 1000;
       const d = haversine(prev, p);
       const kmh = dt > 0 ? d / dt * 3.6 : 0;
-      const bridge = dt <= BRIDGE_MAX_S && d >= BRIDGE_MIN_M && kmh >= VEHICLE_KMH;
-      if ((dt > GAP_SPLIT_S && !bridge) || kmh > MAX_JUMP_KMH) {
+      const tunnel = dt <= BRIDGE_MAX_S && d >= BRIDGE_MIN_M && kmh >= VEHICLE_KMH;
+      const parked = dt <= PARK_MAX_S && d <= PARK_MAX_M &&
+        nearbySpeed(pts, i - 1, -1) >= VEHICLE_KMH && nearbySpeed(pts, i, 1) >= VEHICLE_KMH;
+      if ((dt > GAP_SPLIT_S && !tunnel && !parked) || kmh > MAX_JUMP_KMH) {
         if (cur.length >= 2) out.push(cur);
         cur = [];
       }
