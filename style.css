@@ -103,6 +103,9 @@ button.icon { background: none; border: none; padding: 4px 6px; font-size: 16px;
 
 details summary { cursor: pointer; color: var(--muted); }
 details[open] summary { margin-bottom: 8px; }
+.check { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; cursor: pointer; }
+.check input { margin-top: 3px; accent-color: var(--accent); }
+.check small { color: var(--muted); }
 .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 
 #drop {

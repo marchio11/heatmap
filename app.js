@@ -81,6 +81,10 @@ const DB = {
     const r = await this._tx('readonly', (s) => s ? s.getAll() : null);
     return r || [...this._mem.values()];
   },
+  async get(name) {
+    const r = await this._tx('readonly', (s) => s ? s.get(name) : null);
+    return r || this._mem.get(name);
+  },
   async put(rec) {
     this._mem.set(rec.name, rec);
     await this._tx('readwrite', (s) => s && s.put(rec));
@@ -157,10 +161,11 @@ function classify(pts) {
     legs.push({ d, v: dt > 0 ? d / dt * 3.6 : null, mid: dt > 0 ? (a[2] + b[2]) / 2 : null });
   }
   const km = { walk: 0, vehicle: 0 };
+  const modes = []; // per ogni tratto: 'w' a piedi, 'v' veicolo
   let lo = 0, hi = 0;
   for (let i = 0; i < legs.length; i++) {
     const leg = legs[i];
-    if (leg.mid === null) { km.walk += leg.d / 1000; continue; }
+    if (leg.mid === null) { km.walk += leg.d / 1000; modes.push('w'); continue; }
     while (lo < i && (legs[lo].mid === null || legs[lo].mid < leg.mid - MODE_WINDOW_MS)) lo++;
     if (hi < i) hi = i;
     while (hi + 1 < legs.length && legs[hi + 1].mid !== null && legs[hi + 1].mid <= leg.mid + MODE_WINDOW_MS) hi++;
@@ -168,9 +173,131 @@ function classify(pts) {
     for (let j = lo; j <= hi; j++) if (legs[j].v !== null) speeds.push(legs[j].v);
     speeds.sort((x, y) => x - y);
     const p90 = speeds[Math.floor(0.9 * (speeds.length - 1))] || 0;
-    km[p90 > VEHICLE_KMH ? 'vehicle' : 'walk'] += leg.d / 1000;
+    const isVehicle = p90 > VEHICLE_KMH;
+    km[isVehicle ? 'vehicle' : 'walk'] += leg.d / 1000;
+    modes.push(isVehicle ? 'v' : 'w');
   }
-  return km;
+  return { km, modes };
+}
+
+// Gruppi consecutivi di tratti in veicolo, come indici dei punti [i0, i1]
+function vehicleRuns(modes) {
+  const runs = [];
+  let start = -1;
+  for (let i = 0; i <= modes.length; i++) {
+    const v = modes[i] === 'v';
+    if (v && start < 0) start = i;
+    if (!v && start >= 0) {
+      if (i - start >= 2) runs.push([start, i]); // almeno 3 punti
+      start = -1;
+    }
+  }
+  return runs;
+}
+
+function pathLength(pts, i0 = 0, i1 = pts.length - 1) {
+  let d = 0;
+  for (let i = i0 + 1; i <= i1; i++) d += haversine(pts[i - 1], pts[i]);
+  return d;
+}
+
+/* ---------------- Aggancio alle strade (map matching) ---------------- */
+
+// Server pubblico e gratuito di OSRM (motore di navigazione basato su OpenStreetMap).
+// Riceve solo le coordinate dei tratti in veicolo, una volta sola: il risultato resta nel browser.
+const OSRM_URL = 'https://router.project-osrm.org/match/v1/driving/';
+const MATCH_VERSION = 1;
+const MATCH_CHUNK = 90;   // il server accetta al massimo 100 punti per richiesta
+const MATCH_RADIUS = 35;  // metri di tolleranza intorno a ogni punto GPS
+
+const snapEnabled = () => store.get('snap', '1') === '1';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function matchChunk(chunk) {
+  // i tempi devono essere strettamente crescenti
+  const pts = chunk.filter((p, i) => i === 0 || p[2] === null || chunk[i - 1][2] === null || p[2] - chunk[i - 1][2] >= 1000);
+  if (pts.length < 2) return null;
+  const params = new URLSearchParams({
+    overview: 'full',
+    geometries: 'geojson',
+    gaps: 'ignore',
+    tidy: 'true',
+    radiuses: pts.map(() => MATCH_RADIUS).join(';'),
+  });
+  if (pts.every((p) => p[2] !== null)) params.set('timestamps', pts.map((p) => Math.round(p[2] / 1000)).join(';'));
+  const url = OSRM_URL + pts.map((p) => `${p[1].toFixed(6)},${p[0].toFixed(6)}`).join(';') + '?' + params;
+
+  const res = await fetch(url);
+  let json = null;
+  try { json = await res.json(); } catch { /* risposta non JSON */ }
+  if (json && json.code === 'Ok' && json.matchings?.length) {
+    const coords = [];
+    let dist = 0;
+    for (const m of json.matchings) {
+      for (const [lon, lat] of m.geometry.coordinates) coords.push([lat, lon]);
+      dist += m.distance;
+    }
+    // risultato poco credibile (giri strani molto più lunghi della traccia): meglio la traccia originale
+    if (dist > 2 * pathLength(pts) + 500) return null;
+    return coords;
+  }
+  if (json && /^(NoMatch|NoSegment|TooBig|InvalidInput|InvalidValue)$/.test(json.code)) return null;
+  throw new Error('Server delle strade non disponibile');
+}
+
+async function matchRun(pts) {
+  const out = [];
+  let matchedAny = false;
+  for (let s = 0; s < pts.length - 1; s += MATCH_CHUNK - 1) {
+    const chunk = pts.slice(s, s + MATCH_CHUNK);
+    const coords = await matchChunk(chunk);
+    await sleep(1100); // massimo una richiesta al secondo, come chiede il server
+    const piece = coords || chunk.map((p) => [p[0], p[1]]);
+    if (coords) matchedAny = true;
+    out.push(...(out.length ? piece.slice(1) : piece));
+  }
+  return matchedAny ? out : null;
+}
+
+let matching = false;
+
+async function matchPending() {
+  if (matching || !snapEnabled()) return;
+  matching = true;
+  let worked = false;
+  try {
+    for (;;) {
+      const todo = (await DB.all()).filter((r) => !r.match || r.match.v !== MATCH_VERSION);
+      if (!todo.length) break;
+      worked = true;
+      let done = 0;
+      for (const rec of todo) {
+        setStatus(`Aggancio i percorsi in auto alle strade… ${++done}/${todo.length}`);
+        const segs = [];
+        for (const pts of rec.segments) {
+          const runs = [];
+          for (const [i0, i1] of vehicleRuns(classify(pts).modes)) {
+            const coords = await matchRun(pts.slice(i0, i1 + 1));
+            runs.push({ i0, i1, coords, dist: coords ? pathLength(coords) : null });
+          }
+          segs.push(runs);
+        }
+        // salva solo se nel frattempo il file non è stato aggiornato
+        const fresh = await DB.get(rec.name);
+        if (fresh && fresh.modifiedTime === rec.modifiedTime) {
+          fresh.match = { v: MATCH_VERSION, segs };
+          await DB.put(fresh);
+        }
+        buildIndex(await DB.all());
+        render(false);
+      }
+    }
+    if (worked) setStatus('Percorsi in auto agganciati alle strade.');
+  } catch (err) {
+    setStatus('Aggancio alle strade non riuscito ora, riproverò più tardi.', true);
+  } finally {
+    matching = false;
+  }
 }
 
 /* ---------------- Indice dei dati ---------------- */
@@ -181,7 +308,8 @@ function buildIndex(records) {
   const segs = [];
   for (const rec of records) {
     const fromName = /(\d{4})(\d{2})(\d{2})/.exec(rec.name);
-    for (const pts of rec.segments) {
+    const matched = snapEnabled() && rec.match && rec.match.v === MATCH_VERSION ? rec.match.segs : null;
+    rec.segments.forEach((pts, k) => {
       let day;
       if (pts[0][2] !== null) {
         const d = new Date(pts[0][2]);
@@ -191,21 +319,40 @@ function buildIndex(records) {
       } else {
         day = 'senza data';
       }
+      const { km } = classify(pts);
+      let path = pts;
+      const runs = matched && matched[k];
+      if (runs && runs.length) {
+        // i tratti in veicolo agganciati alle strade sostituiscono quelli GPS
+        path = [];
+        let i = 0;
+        for (const r of runs) {
+          while (i < r.i0) path.push(pts[i++]);
+          if (r.coords) {
+            path.push(...r.coords);
+            km.vehicle += (r.dist - pathLength(pts, r.i0, r.i1)) / 1000;
+          } else {
+            for (let j = r.i0; j <= r.i1; j++) path.push(pts[j]);
+          }
+          i = r.i1 + 1;
+        }
+        while (i < pts.length) path.push(pts[i++]);
+      }
       let minLat = 90, minLon = 180, maxLat = -90, maxLon = -180;
-      for (const p of pts) {
+      for (const p of path) {
         if (p[0] < minLat) minLat = p[0];
         if (p[0] > maxLat) maxLat = p[0];
         if (p[1] < minLon) minLon = p[1];
         if (p[1] > maxLon) maxLon = p[1];
       }
       segs.push({
-        pts,
+        path,
         day,
         year: day.slice(0, 4),
         bbox: [minLat, minLon, maxLat, maxLon],
-        km: classify(pts),
+        km,
       });
-    }
+    });
   }
   allSegments = segs;
 }
@@ -303,7 +450,7 @@ const HeatLayer = L.Layer.extend({
       if (maxLat < s || minLat > n || maxLon < w || minLon > e) continue;
       acc.beginPath();
       let lx = null, ly = null;
-      for (const p of seg.pts) {
+      for (const p of seg.path) {
         const pt = map.latLngToContainerPoint([p[0], p[1]]);
         const x = pt.x * dpr, y = pt.y * dpr;
         if (lx === null) acc.moveTo(x, y);
@@ -384,6 +531,7 @@ async function reloadFromDb(fit) {
   buildIndex(await DB.all());
   refreshYears();
   render(fit);
+  matchPending();
 }
 
 $('year').addEventListener('change', () => { store.set('year', $('year').value); render(true); });
@@ -392,6 +540,13 @@ $('toggle').addEventListener('click', () => $('panel').classList.toggle('collaps
 const folderInput = $('folder');
 folderInput.value = store.get('folder', CONFIG.defaultFolder);
 folderInput.addEventListener('change', () => store.set('folder', folderInput.value.trim() || CONFIG.defaultFolder));
+
+const snapInput = $('snap');
+snapInput.checked = snapEnabled();
+snapInput.addEventListener('change', async () => {
+  store.set('snap', snapInput.checked ? '1' : '0');
+  await reloadFromDb(false);
+});
 
 $('clear').addEventListener('click', async () => {
   if (!confirm('Cancellare i dati salvati in questo browser? I file su Drive non vengono toccati.')) return;

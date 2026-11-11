@@ -46,8 +46,12 @@
           <span>Cartella su Google Drive</span>
           <input id="folder" type="text" placeholder="GPSLogger">
         </label>
+        <label class="check">
+          <input id="snap" type="checkbox">
+          <span>Aggancia alle strade i percorsi in auto <small>(usa il server pubblico gratuito di OSRM)</small></span>
+        </label>
         <button id="clear" class="danger">Cancella i dati salvati nel browser</button>
-        <p class="hint">I file GPX restano solo su Drive e nel tuo browser: nessun server.</p>
+        <p class="hint">I file GPX restano su Drive e nel tuo browser. Se l'aggancio alle strade è attivo, solo coordinate e orari dei tratti in auto vengono inviati al server OSRM, senza nessun dato personale.</p>
       </details>
     </div>
   </aside>
