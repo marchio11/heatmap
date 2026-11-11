@@ -23,6 +23,9 @@ html, body {
 
 .heat-canvas { position: absolute; pointer-events: none; }
 
+/* Mappa OSM chiara trasformata in una mappa scura e desaturata */
+.dark-tiles { filter: invert(1) hue-rotate(180deg) grayscale(0.85) brightness(0.75) contrast(1.15); }
+
 #panel {
   position: fixed;
   top: max(12px, env(safe-area-inset-top));

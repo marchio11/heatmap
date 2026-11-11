@@ -335,10 +335,11 @@ const HeatLayer = L.Layer.extend({
 
 const map = L.map('map', { zoomControl: false, worldCopyJump: true }).setView([42.5, 12.5], 6);
 L.control.zoom({ position: 'bottomright' }).addTo(map);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-  subdomains: 'abcd',
-  maxZoom: 20,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+// Mappa standard di OpenStreetMap (gratuita, senza chiave), scurita via CSS (.dark-tiles)
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  className: 'dark-tiles',
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
 }).addTo(map);
 const heat = new HeatLayer().addTo(map);
 
