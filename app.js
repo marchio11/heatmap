@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 4;
-const APP_VERSION = '9';
+const APP_VERSION = '10';
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
@@ -320,6 +320,13 @@ async function matchRun(pts) {
   return { coords: matchedAny ? out : null, why };
 }
 
+// L'aggancio vale solo se fatto con la stessa versione e sulla stessa lettura del file GPX
+function matchValid(rec) {
+  const m = rec.match;
+  return !!m && m.v === MATCH_VERSION && m.pv === (rec.pv ?? null) &&
+    m.n === rec.segments.length && Array.isArray(m.segs) && m.segs.length === rec.segments.length;
+}
+
 let matching = false;
 
 async function matchPending() {
@@ -328,7 +335,7 @@ async function matchPending() {
   let worked = false;
   try {
     for (;;) {
-      const todo = (await DB.all()).filter((r) => !r.match || r.match.v !== MATCH_VERSION);
+      const todo = (await DB.all()).filter((r) => !matchValid(r));
       if (!todo.length) break;
       worked = true;
       let done = 0;
@@ -346,7 +353,7 @@ async function matchPending() {
         // salva solo se nel frattempo il file non è stato aggiornato
         const fresh = await DB.get(rec.name);
         if (fresh && fresh.modifiedTime === rec.modifiedTime) {
-          fresh.match = { v: MATCH_VERSION, segs };
+          fresh.match = { v: MATCH_VERSION, pv: fresh.pv ?? null, n: fresh.segments.length, segs };
           await DB.put(fresh);
           if (fresh.source === 'drive') store.set('cacheDirty', '1');
         }
@@ -375,7 +382,7 @@ function buildIndex(records) {
   const segs = [];
   for (const rec of records) {
     const fromName = /(\d{4})(\d{2})(\d{2})/.exec(rec.name);
-    const matched = snapEnabled() && rec.match && rec.match.v === MATCH_VERSION ? rec.match.segs : null;
+    const matched = snapEnabled() && matchValid(rec) ? rec.match.segs : null;
     rec.segments.forEach((pts, k) => {
       let day;
       if (pts[0][2] !== null) {
@@ -388,7 +395,9 @@ function buildIndex(records) {
       }
       const { km } = classify(pts);
       let path = pts;
-      const runs = matched && matched[k];
+      let runs = matched && matched[k];
+      // protezione: un aggancio che non corrisponde ai punti viene ignorato (verrà rifatto)
+      if (runs && runs.some((r) => r.i1 >= pts.length || r.i0 > r.i1)) runs = null;
       if (runs && runs.length) {
         // i tratti in veicolo agganciati alle strade sostituiscono quelli GPS
         path = [];
@@ -874,10 +883,11 @@ async function applyRemoteCache() {
   if (!getHome() && Array.isArray(cache.home)) setHome(cache.home, false);
   let applied = 0;
   for (const rec of await DB.all()) {
-    if (rec.source !== 'drive' || (rec.match && rec.match.v === MATCH_VERSION)) continue;
+    if (rec.source !== 'drive' || matchValid(rec)) continue;
     const e = cache.entries[rec.name];
-    if (e && e.v === MATCH_VERSION && e.modifiedTime === rec.modifiedTime) {
-      rec.match = { v: e.v, segs: e.segs };
+    if (e && e.v === MATCH_VERSION && e.modifiedTime === rec.modifiedTime && e.pv === (rec.pv ?? null) &&
+        e.n === rec.segments.length) {
+      rec.match = { v: e.v, pv: e.pv, n: e.n, segs: e.segs };
       await DB.put(rec);
       applied++;
     }
@@ -891,8 +901,8 @@ async function uploadCache() {
   const file = await findCacheFile();
   const cache = await downloadCache(file);
   for (const rec of await DB.all()) {
-    if (rec.source !== 'drive' || !rec.match || rec.match.v !== MATCH_VERSION) continue;
-    cache.entries[rec.name] = { v: rec.match.v, modifiedTime: rec.modifiedTime, segs: rec.match.segs };
+    if (rec.source !== 'drive' || !matchValid(rec)) continue;
+    cache.entries[rec.name] = { v: rec.match.v, pv: rec.match.pv, n: rec.match.n, modifiedTime: rec.modifiedTime, segs: rec.match.segs };
   }
   if (getHome()) cache.home = getHome();
   cache.updated = new Date().toISOString();
