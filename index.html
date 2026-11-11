@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#0e0f13">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230e0f13'/%3E%3Cpath d='M5 24 Q12 6 16 16 T27 8' stroke='%23ff8a2a' stroke-width='3.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=6">
 </head>
 <body>
   <div id="map"></div>
@@ -54,6 +54,8 @@
           <span>Aggancia alle strade i percorsi in auto <small>(usa il server pubblico gratuito di OSRM)</small></span>
         </label>
         <button id="clear" class="danger">Cancella i dati salvati nel browser</button>
+        <p id="diag" class="hint"></p>
+        <p class="hint">Versione app: <span id="ver"></span></p>
         <p class="hint">I file GPX restano su Drive e nel tuo browser. Se l'aggancio alle strade è attivo, solo coordinate e orari dei tratti in auto vengono inviati al server OSRM, senza nessun dato personale. Per il punto più alto vengono chieste a Open-Meteo le quote dei luoghi visitati, sempre in forma anonima.</p>
       </details>
     </div>
@@ -63,6 +65,6 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>

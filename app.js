@@ -14,6 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 2;
+const APP_VERSION = '6';
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
@@ -216,13 +217,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function matchChunk(chunk) {
   // i tempi devono essere strettamente crescenti
   const pts = chunk.filter((p, i) => i === 0 || p[2] === null || chunk[i - 1][2] === null || p[2] - chunk[i - 1][2] >= 1000);
-  if (pts.length < 2) return null;
+  if (pts.length < 2) return { why: 'pochi punti' };
+  let r;
   for (let k = 0; k < MATCH_RADII.length; k++) {
     if (k) await sleep(1100);
-    const r = await osrmMatch(pts, MATCH_RADII[k]);
-    if (r !== 'retry') return r;
+    r = await osrmMatch(pts, MATCH_RADII[k]);
+    if (r.why !== 'NoSegment') return r;
   }
-  return null;
+  return r;
 }
 
 async function osrmMatch(pts, radius) {
@@ -247,26 +249,27 @@ async function osrmMatch(pts, radius) {
       dist += m.distance;
     }
     // risultato poco credibile (giri strani molto più lunghi della traccia): meglio la traccia originale
-    if (dist > 2 * pathLength(pts) + 500) return null;
-    return coords;
+    if (dist > 2 * pathLength(pts) + 500) return { why: 'percorso poco credibile' };
+    return { coords };
   }
-  if (json && json.code === 'NoSegment') return 'retry';
-  if (json && /^(NoMatch|TooBig|InvalidInput|InvalidValue)$/.test(json.code)) return null;
+  if (json && json.code && json.code !== 'Ok') return { why: json.code };
   throw new Error('Server delle strade non disponibile');
 }
 
 async function matchRun(pts) {
   const out = [];
   let matchedAny = false;
+  let why = null;
   for (let s = 0; s < pts.length - 1; s += MATCH_CHUNK - 1) {
     const chunk = pts.slice(s, s + MATCH_CHUNK);
-    const coords = await matchChunk(chunk);
+    const { coords, why: w } = await matchChunk(chunk);
     await sleep(1100); // massimo una richiesta al secondo, come chiede il server
     const piece = coords || chunk.map((p) => [p[0], p[1]]);
     if (coords) matchedAny = true;
+    else why = w;
     out.push(...(out.length ? piece.slice(1) : piece));
   }
-  return matchedAny ? out : null;
+  return { coords: matchedAny ? out : null, why };
 }
 
 let matching = false;
@@ -287,8 +290,8 @@ async function matchPending() {
         for (const pts of rec.segments) {
           const runs = [];
           for (const [i0, i1] of vehicleRuns(classify(pts).modes)) {
-            const coords = await matchRun(pts.slice(i0, i1 + 1));
-            runs.push({ i0, i1, coords, dist: coords ? pathLength(coords) : null });
+            const { coords, why } = await matchRun(pts.slice(i0, i1 + 1));
+            runs.push({ i0, i1, coords, why, dist: coords ? pathLength(coords) : null });
           }
           segs.push(runs);
         }
@@ -312,6 +315,7 @@ async function matchPending() {
     setStatus('Aggancio alle strade non riuscito ora, riproverò più tardi.', true);
   } finally {
     matching = false;
+    renderDiag(currentSegments());
   }
 }
 
@@ -362,6 +366,7 @@ function buildIndex(records) {
       }
       segs.push({
         path,
+        runs: runs || [],
         day,
         year: day.slice(0, 4),
         bbox: [minLat, minLon, maxLat, maxLon],
@@ -653,6 +658,7 @@ function render(fit) {
   $('kmVehicle').textContent = segs.length ? fmtKm(vehicle) : '–';
   $('days').textContent = segs.length ? days.size : '–';
   renderRecords();
+  renderDiag(segs);
 
   if (fit && segs.length) {
     let b = null;
@@ -664,6 +670,22 @@ function render(fit) {
   }
 }
 
+// Riepilogo dell'aggancio alle strade (in Impostazioni), utile per capire cosa non va
+function renderDiag(segs) {
+  let ok = 0, ko = 0;
+  const reasons = {};
+  for (const s of segs) {
+    for (const r of s.runs || []) {
+      if (r.coords) ok++;
+      else { ko++; reasons[r.why || 'sconosciuto'] = (reasons[r.why || 'sconosciuto'] || 0) + 1; }
+    }
+  }
+  const why = Object.entries(reasons).map(([k, n]) => `${k} ×${n}`).join(', ');
+  $('diag').textContent = snapEnabled()
+    ? `Tratti in auto: ${ok} agganciati, ${ko} no` + (ko ? ` (${why})` : '') + (matching ? ' — elaborazione in corso…' : '')
+    : 'Aggancio alle strade disattivato.';
+}
+
 async function reloadFromDb(fit) {
   buildIndex(await DB.all());
   refreshYears();
@@ -671,6 +693,8 @@ async function reloadFromDb(fit) {
   matchPending();
   fillElevations();
 }
+
+$('ver').textContent = APP_VERSION;
 
 $('year').addEventListener('change', () => { store.set('year', $('year').value); render(true); });
 $('toggle').addEventListener('click', () => $('panel').classList.toggle('collapsed'));
