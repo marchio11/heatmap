@@ -292,6 +292,7 @@ async function matchPending() {
         }
         buildIndex(await DB.all());
         render(false);
+        fillElevations();
       }
     }
     if (worked) setStatus('Percorsi in auto agganciati alle strade.');
@@ -495,6 +496,128 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 }).addTo(map);
 const heat = new HeatLayer().addTo(map);
 
+/* ---------------- Record: punto più alto e più lontano da casa ---------------- */
+
+// Le quote arrivano dal modello del terreno Copernicus tramite Open-Meteo (gratis, senza chiave):
+// più affidabili dell'altitudine GPS. Ogni "cella" di circa 50 m viene chiesta una volta sola.
+const ELEV_CELL = 2000;
+const cellKey = (p) => Math.round(p[0] * ELEV_CELL) + ',' + Math.round(p[1] * ELEV_CELL);
+let elevCache = {};
+try { elevCache = JSON.parse(store.get('elev', '{}')) || {}; } catch { elevCache = {}; }
+let elevBusy = false;
+
+async function fillElevations() {
+  if (elevBusy) return;
+  elevBusy = true;
+  try {
+    const missing = new Map();
+    for (const seg of allSegments) {
+      for (const p of seg.path) {
+        const k = cellKey(p);
+        if (!(k in elevCache) && !missing.has(k)) missing.set(k, p);
+      }
+    }
+    const list = [...missing.entries()];
+    for (let i = 0; i < list.length; i += 100) {
+      const batch = list.slice(i, i + 100);
+      const url = 'https://api.open-meteo.com/v1/elevation?latitude=' +
+        batch.map(([, p]) => p[0].toFixed(5)).join(',') + '&longitude=' +
+        batch.map(([, p]) => p[1].toFixed(5)).join(',');
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('quote non disponibili');
+      const json = await res.json();
+      batch.forEach(([k], n) => {
+        const e = json.elevation && json.elevation[n];
+        if (typeof e === 'number' && isFinite(e)) elevCache[k] = Math.round(e);
+      });
+      store.set('elev', JSON.stringify(elevCache));
+      if (list.length > 300) setStatus(`Calcolo le quote… ${Math.min(i + 100, list.length)}/${list.length}`);
+      await sleep(250);
+    }
+    if (list.length) renderRecords();
+  } catch { /* riprova alla prossima apertura */ } finally {
+    elevBusy = false;
+  }
+}
+
+function getHome() {
+  try {
+    const h = JSON.parse(store.get('home', 'null'));
+    return Array.isArray(h) && h.length === 2 ? h : null;
+  } catch { return null; }
+}
+
+function setHome(latlng, share = true) {
+  store.set('home', JSON.stringify([+latlng[0].toFixed(5), +latlng[1].toFixed(5)]));
+  renderRecords();
+  if (share) {
+    store.set('cacheDirty', '1');
+    if (canUseAppData()) uploadCache().catch(() => {});
+  }
+}
+
+const recLayer = L.layerGroup().addTo(map);
+const recPoints = { high: null, far: null };
+const emojiIcon = (e) => L.divIcon({ className: 'rec-icon', html: e, iconSize: [30, 30], iconAnchor: [15, 15] });
+const fmtDay = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d) ? new Date(d + 'T12:00:00').toLocaleDateString('it-IT', { day: 'numeric', month: 'long', year: 'numeric' }) : d;
+
+function renderRecords() {
+  recLayer.clearLayers();
+  const home = getHome();
+  let high = null, far = null;
+  for (const seg of currentSegments()) {
+    for (const p of seg.path) {
+      const e = elevCache[cellKey(p)];
+      if (e !== undefined && (!high || e > high.e)) high = { e, p, day: seg.day };
+      if (home) {
+        const d = haversine(home, p);
+        if (!far || d > far.d) far = { d, p, day: seg.day };
+      }
+    }
+  }
+  recPoints.high = high;
+  recPoints.far = far;
+
+  $('high').textContent = high ? high.e.toLocaleString('it-IT') + ' m' : '–';
+  $('far').textContent = !home ? 'imposta casa' : far ? fmtKm(far.d / 1000) : '–';
+
+  if (home) {
+    L.marker(home, { icon: emojiIcon('🏠'), keyboard: false }).bindTooltip('Casa').addTo(recLayer);
+  }
+  if (far && far.d > 200) {
+    L.polyline([home, [far.p[0], far.p[1]]], { color: '#7fd3ff', weight: 1.5, opacity: 0.8, dashArray: '6 6', interactive: false }).addTo(recLayer);
+    L.marker([far.p[0], far.p[1]], { icon: emojiIcon('📍') })
+      .bindTooltip(`Il punto più lontano da casa: ${fmtKm(far.d / 1000)}<br>${fmtDay(far.day)}`).addTo(recLayer);
+  }
+  if (high) {
+    L.marker([high.p[0], high.p[1]], { icon: emojiIcon('⛰️') })
+      .bindTooltip(`Il punto più alto: ${high.e.toLocaleString('it-IT')} m s.l.m.<br>${fmtDay(high.day)}`).addTo(recLayer);
+  }
+}
+
+function goTo(rec) {
+  if (!rec) return;
+  map.setView([rec.p[0], rec.p[1]], Math.max(map.getZoom(), 14));
+  if (window.innerWidth <= 600) $('panel').classList.add('collapsed');
+}
+$('recHigh').addEventListener('click', () => goTo(recPoints.high));
+$('recFar').addEventListener('click', () => {
+  if (!getHome()) return pickHome();
+  goTo(recPoints.far);
+});
+
+function pickHome() {
+  setStatus('Tocca la mappa nel punto in cui si trova casa tua.');
+  document.body.classList.add('picking');
+  if (window.innerWidth <= 600) $('panel').classList.add('collapsed');
+  map.once('click', (e) => {
+    document.body.classList.remove('picking');
+    setHome([e.latlng.lat, e.latlng.lng]);
+    setStatus('Casa impostata 🏠');
+  });
+}
+$('setHome').addEventListener('click', pickHome);
+
 function currentSegments() {
   const y = $('year').value;
   return y === 'all' ? allSegments : allSegments.filter((s) => s.year === y);
@@ -521,6 +644,7 @@ function render(fit) {
   $('kmWalk').textContent = segs.length ? fmtKm(walk) : '–';
   $('kmVehicle').textContent = segs.length ? fmtKm(vehicle) : '–';
   $('days').textContent = segs.length ? days.size : '–';
+  renderRecords();
 
   if (fit && segs.length) {
     let b = null;
@@ -537,6 +661,7 @@ async function reloadFromDb(fit) {
   refreshYears();
   render(fit);
   matchPending();
+  fillElevations();
 }
 
 $('year').addEventListener('change', () => { store.set('year', $('year').value); render(true); });
@@ -666,6 +791,7 @@ async function downloadCache(file) {
 async function applyRemoteCache() {
   if (!canUseAppData()) return 0;
   const cache = await downloadCache(await findCacheFile());
+  if (!getHome() && Array.isArray(cache.home)) setHome(cache.home, false);
   let applied = 0;
   for (const rec of await DB.all()) {
     if (rec.source !== 'drive' || (rec.match && rec.match.v === MATCH_VERSION)) continue;
@@ -688,6 +814,7 @@ async function uploadCache() {
     if (rec.source !== 'drive' || !rec.match || rec.match.v !== MATCH_VERSION) continue;
     cache.entries[rec.name] = { v: rec.match.v, modifiedTime: rec.modifiedTime, segs: rec.match.segs };
   }
+  if (getHome()) cache.home = getHome();
   cache.updated = new Date().toISOString();
   const body = JSON.stringify(cache);
   const up = 'https://www.googleapis.com/upload/drive/v3/';

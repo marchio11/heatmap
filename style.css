@@ -77,6 +77,12 @@ select, input[type="text"] {
 .stats .lbl { color: var(--muted); }
 .stats .val { font-variant-numeric: tabular-nums; font-weight: 600; }
 
+.stats .rec { cursor: pointer; border-radius: 6px; }
+.stats .rec:hover .val { color: var(--accent); }
+#setHome { width: 100%; margin-top: 10px; }
+body.picking .leaflet-container { cursor: crosshair; }
+.rec-icon { font-size: 22px; line-height: 30px; text-align: center; filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.8)); }
+
 .actions { display: grid; grid-template-columns: 1fr; gap: 6px; }
 
 button, .btn {

@@ -28,6 +28,8 @@
         <div><span class="lbl">🚶 A piedi</span><span id="kmWalk" class="val">–</span></div>
         <div><span class="lbl">🚗 Veicoli</span><span id="kmVehicle" class="val">–</span></div>
         <div><span class="lbl">📅 Giorni registrati</span><span id="days" class="val">–</span></div>
+        <div id="recHigh" class="rec" title="Mostra sulla mappa"><span class="lbl">⛰️ Punto più alto</span><span id="high" class="val">–</span></div>
+        <div id="recFar" class="rec" title="Mostra sulla mappa"><span class="lbl">📍 Più lontano da casa</span><span id="far" class="val">–</span></div>
       </div>
 
       <div class="actions">
@@ -46,12 +48,13 @@
           <span>Cartella su Google Drive</span>
           <input id="folder" type="text" placeholder="GPSLogger">
         </label>
+        <button id="setHome">🏠 Imposta casa sulla mappa</button>
         <label class="check">
           <input id="snap" type="checkbox">
           <span>Aggancia alle strade i percorsi in auto <small>(usa il server pubblico gratuito di OSRM)</small></span>
         </label>
         <button id="clear" class="danger">Cancella i dati salvati nel browser</button>
-        <p class="hint">I file GPX restano su Drive e nel tuo browser. Se l'aggancio alle strade è attivo, solo coordinate e orari dei tratti in auto vengono inviati al server OSRM, senza nessun dato personale.</p>
+        <p class="hint">I file GPX restano su Drive e nel tuo browser. Se l'aggancio alle strade è attivo, solo coordinate e orari dei tratti in auto vengono inviati al server OSRM, senza nessun dato personale. Per il punto più alto vengono chieste a Open-Meteo le quote dei luoghi visitati, sempre in forma anonima.</p>
       </details>
     </div>
   </aside>
