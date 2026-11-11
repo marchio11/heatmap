@@ -13,11 +13,13 @@ const CONFIG = {
 };
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
-const PARSE_VERSION = 2;
-const APP_VERSION = '7';
+const PARSE_VERSION = 3;
+const APP_VERSION = '8';
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
+const BRIDGE_MAX_S = 30 * 60; // ...ma un "silenzio" fino a 30 minuti percorso a velocità da veicolo
+const BRIDGE_MIN_M = 1000;    // (gallerie, GPS assente) viene collegato e poi agganciato alla strada
 // Piedi / veicolo
 const VEHICLE_KMH = 25;       // sopra questa velocità "di punta" è un veicolo
 const MODE_WINDOW_MS = 3 * 60 * 1000; // finestra di ±3 minuti per decidere
@@ -128,6 +130,8 @@ function parseGpx(text) {
 }
 
 // Divide la traccia dove ci sono pause lunghe o salti impossibili del GPS.
+// Eccezione: se durante una pausa lunga ci si è spostati di almeno 1 km a velocità media
+// da veicolo (es. una galleria lunga), i due punti restano collegati.
 function splitSegment(pts) {
   const out = [];
   let cur = [];
@@ -135,8 +139,10 @@ function splitSegment(pts) {
     const prev = cur[cur.length - 1];
     if (prev && p[2] !== null && prev[2] !== null) {
       const dt = (p[2] - prev[2]) / 1000;
-      const kmh = dt > 0 ? haversine(prev, p) / dt * 3.6 : 0;
-      if (dt > GAP_SPLIT_S || kmh > MAX_JUMP_KMH) {
+      const d = haversine(prev, p);
+      const kmh = dt > 0 ? d / dt * 3.6 : 0;
+      const bridge = dt <= BRIDGE_MAX_S && d >= BRIDGE_MIN_M && kmh >= VEHICLE_KMH;
+      if ((dt > GAP_SPLIT_S && !bridge) || kmh > MAX_JUMP_KMH) {
         if (cur.length >= 2) out.push(cur);
         cur = [];
       }
