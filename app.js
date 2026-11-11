@@ -6,7 +6,8 @@
 
 const CONFIG = {
   clientId: '420044332179-nrbh6dcti0mst8qal370e2rlq5obqpb6.apps.googleusercontent.com',
-  scope: 'https://www.googleapis.com/auth/drive.readonly',
+  // lettura di Drive + cartella nascosta dell'app (dove condividiamo i percorsi già agganciati)
+  scope: 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata',
   defaultFolder: 'GPSLogger',
   fallbackFolders: ['GPSLogger for Android'],
 };
@@ -287,12 +288,16 @@ async function matchPending() {
         if (fresh && fresh.modifiedTime === rec.modifiedTime) {
           fresh.match = { v: MATCH_VERSION, segs };
           await DB.put(fresh);
+          if (fresh.source === 'drive') store.set('cacheDirty', '1');
         }
         buildIndex(await DB.all());
         render(false);
       }
     }
     if (worked) setStatus('Percorsi in auto agganciati alle strade.');
+    if (store.get('cacheDirty', '0') === '1' && canUseAppData()) {
+      try { await uploadCache(); } catch { /* riprova alla prossima sincronizzazione */ }
+    }
   } catch (err) {
     setStatus('Aggancio alle strade non riuscito ora, riproverò più tardi.', true);
   } finally {
@@ -590,7 +595,7 @@ let tokenClient = null;
 let token = null;
 try {
   const saved = JSON.parse(sessionStorage.getItem('gtoken') || 'null');
-  if (saved && saved.exp > Date.now() + 60000) token = saved;
+  if (saved && saved.exp > Date.now() + 60000 && saved.scope) token = saved;
 } catch { /* ignora */ }
 
 function getToken() {
@@ -602,7 +607,7 @@ function getToken() {
     }
     tokenClient.callback = (resp) => {
       if (resp.error) return reject(new Error('Accesso non riuscito: ' + resp.error));
-      token = { value: resp.access_token, exp: Date.now() + resp.expires_in * 1000 };
+      token = { value: resp.access_token, exp: Date.now() + resp.expires_in * 1000, scope: resp.scope || '' };
       try { sessionStorage.setItem('gtoken', JSON.stringify(token)); } catch { /* ignora */ }
       resolve(token.value);
     };
@@ -611,10 +616,13 @@ function getToken() {
   });
 }
 
-async function drive(path, params, asText) {
-  const url = new URL('https://www.googleapis.com/drive/v3/' + path);
+const tokenValid = () => !!token && token.exp > Date.now() + 60000;
+const canUseAppData = () => tokenValid() && /drive\.appdata/.test(token.scope);
+
+async function drive(path, params, asText, opts = {}, base = 'https://www.googleapis.com/drive/v3/') {
+  const url = new URL(base + path);
   for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
-  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token.value } });
+  const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + token.value } });
   if (res.status === 401) {
     token = null;
     try { sessionStorage.removeItem('gtoken'); } catch { /* ignora */ }
@@ -624,17 +632,78 @@ async function drive(path, params, asText) {
   return asText ? res.text() : res.json();
 }
 
-async function listAll(q, fields) {
+async function listAll(q, fields, spaces = 'drive') {
   const out = [];
   let pageToken = '';
   do {
-    const params = { q, fields: `nextPageToken,files(${fields})`, pageSize: '1000', spaces: 'drive' };
+    const params = { q, fields: `nextPageToken,files(${fields})`, pageSize: '1000', spaces };
     if (pageToken) params.pageToken = pageToken;
     const r = await drive('files', params);
     out.push(...r.files);
     pageToken = r.nextPageToken || '';
   } while (pageToken);
   return out;
+}
+
+/* ---------- Percorsi agganciati condivisi tra dispositivi (cartella nascosta su Drive) ---------- */
+
+const CACHE_NAME = 'match-cache.json';
+
+async function findCacheFile() {
+  const files = await listAll(`name = '${CACHE_NAME}' and trashed = false`, 'id,name', 'appDataFolder');
+  return files[0] || null;
+}
+
+async function downloadCache(file) {
+  if (!file) return { entries: {} };
+  try {
+    const data = JSON.parse(await drive('files/' + file.id, { alt: 'media' }, true));
+    return data && data.entries ? data : { entries: {} };
+  } catch { return { entries: {} }; }
+}
+
+// Usa i percorsi già agganciati da un altro dispositivo
+async function applyRemoteCache() {
+  if (!canUseAppData()) return 0;
+  const cache = await downloadCache(await findCacheFile());
+  let applied = 0;
+  for (const rec of await DB.all()) {
+    if (rec.source !== 'drive' || (rec.match && rec.match.v === MATCH_VERSION)) continue;
+    const e = cache.entries[rec.name];
+    if (e && e.v === MATCH_VERSION && e.modifiedTime === rec.modifiedTime) {
+      rec.match = { v: e.v, segs: e.segs };
+      await DB.put(rec);
+      applied++;
+    }
+  }
+  return applied;
+}
+
+// Salva su Drive i percorsi agganciati da questo dispositivo, unendoli a quelli già presenti
+async function uploadCache() {
+  if (!canUseAppData()) return;
+  const file = await findCacheFile();
+  const cache = await downloadCache(file);
+  for (const rec of await DB.all()) {
+    if (rec.source !== 'drive' || !rec.match || rec.match.v !== MATCH_VERSION) continue;
+    cache.entries[rec.name] = { v: rec.match.v, modifiedTime: rec.modifiedTime, segs: rec.match.segs };
+  }
+  cache.updated = new Date().toISOString();
+  const body = JSON.stringify(cache);
+  const up = 'https://www.googleapis.com/upload/drive/v3/';
+  if (file) {
+    await drive('files/' + file.id, { uploadType: 'media' }, false,
+      { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body }, up);
+  } else {
+    const boundary = 'heatmap' + Math.random().toString(36).slice(2);
+    const multipart =
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+      JSON.stringify({ name: CACHE_NAME, parents: ['appDataFolder'] }) +
+      `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n` + body + `\r\n--${boundary}--`;
+    await drive('files', { uploadType: 'multipart' }, false,
+      { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body: multipart }, up);
+  }
+  store.set('cacheDirty', '0');
 }
 
 async function syncDrive() {
@@ -684,6 +753,8 @@ async function syncDrive() {
     };
     const total = todo.length;
     await Promise.all([worker(), worker(), worker(), worker()]);
+
+    try { await applyRemoteCache(); } catch { /* si aggancia da qui */ }
 
     await reloadFromDb(total > 0);
     setStatus(`Sincronizzato: ${files.length} file su Drive, ${total} aggiornati` + (bad ? `, ${bad} con errori` : '') + '.');
