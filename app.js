@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 2;
-const APP_VERSION = '6';
+const APP_VERSION = '7';
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
@@ -205,7 +205,8 @@ function pathLength(pts, i0 = 0, i1 = pts.length - 1) {
 // Server pubblico e gratuito di OSRM (motore di navigazione basato su OpenStreetMap).
 // Riceve solo le coordinate dei tratti in veicolo, una volta sola: il risultato resta nel browser.
 const OSRM_URL = 'https://router.project-osrm.org/match/v1/driving/';
-const MATCH_VERSION = 2;
+const OSRM_ROUTE_URL = 'https://router.project-osrm.org/route/v1/driving/';
+const MATCH_VERSION = 3;
 const MATCH_CHUNK = 90;   // il server accetta al massimo 100 punti per richiesta
 // metri di tolleranza intorno a ogni punto GPS: se un punto è troppo lontano da strade percorribili
 // in auto (parcheggi o strade private) il server rifiuta tutto, quindi si riprova allargando
@@ -222,9 +223,30 @@ async function matchChunk(chunk) {
   for (let k = 0; k < MATCH_RADII.length; k++) {
     if (k) await sleep(1100);
     r = await osrmMatch(pts, MATCH_RADII[k]);
-    if (r.why !== 'NoSegment') return r;
+    if (r.why !== 'NoSegment') break;
   }
-  return r;
+  if (r.coords) return r;
+  // Piano B: percorso stradale che passa per i punti GPS (ogni punto viene portato sulla strada
+  // più vicina, senza limiti di distanza: funziona anche con parcheggi e strade private)
+  await sleep(1100);
+  const b = await osrmRoute(pts);
+  return b.coords ? b : { why: `${r.why}, piano B: ${b.why}` };
+}
+
+async function osrmRoute(pts) {
+  const params = new URLSearchParams({ overview: 'full', geometries: 'geojson', continue_straight: 'false' });
+  const url = OSRM_ROUTE_URL + pts.map((p) => `${p[1].toFixed(6)},${p[0].toFixed(6)}`).join(';') + '?' + params;
+  const res = await fetch(url);
+  let json = null;
+  try { json = await res.json(); } catch { /* risposta non JSON */ }
+  if (json && json.code === 'Ok' && json.routes?.length) {
+    const route = json.routes[0];
+    // passando per punti imprecisi il percorso può fare giri strani: in quel caso meglio la traccia GPS
+    if (route.distance > 1.6 * pathLength(pts) + 300) return { why: 'percorso poco credibile' };
+    return { coords: route.geometry.coordinates.map(([lon, lat]) => [lat, lon]) };
+  }
+  if (json && json.code) return { why: json.code };
+  throw new Error('Server delle strade non disponibile');
 }
 
 async function osrmMatch(pts, radius) {
