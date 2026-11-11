@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Heatmap</title>
+  <meta name="theme-color" content="#0e0f13">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230e0f13'/%3E%3Cpath d='M5 24 Q12 6 16 16 T27 8' stroke='%23ff8a2a' stroke-width='3.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="map"></div>
+
+  <aside id="panel">
+    <header>
+      <h1>🔥 Heatmap</h1>
+      <button id="toggle" class="icon" aria-label="Mostra/nascondi pannello">▾</button>
+    </header>
+
+    <div class="body">
+      <label class="row">
+        <span>Anno</span>
+        <select id="year"></select>
+      </label>
+
+      <div class="stats">
+        <div><span class="lbl">🚶 A piedi</span><span id="kmWalk" class="val">–</span></div>
+        <div><span class="lbl">🚗 Veicoli</span><span id="kmVehicle" class="val">–</span></div>
+        <div><span class="lbl">📅 Giorni registrati</span><span id="days" class="val">–</span></div>
+      </div>
+
+      <div class="actions">
+        <button id="sync" class="primary">Accedi e sincronizza Drive</button>
+        <label class="btn">
+          Carica GPX
+          <input id="fileInput" type="file" accept=".gpx,application/gpx+xml" multiple hidden>
+        </label>
+      </div>
+
+      <p id="status" role="status"></p>
+
+      <details>
+        <summary>Impostazioni</summary>
+        <label class="row col">
+          <span>Cartella su Google Drive</span>
+          <input id="folder" type="text" placeholder="GPSLogger">
+        </label>
+        <button id="clear" class="danger">Cancella i dati salvati nel browser</button>
+        <p class="hint">I file GPX restano solo su Drive e nel tuo browser: nessun server.</p>
+      </details>
+    </div>
+  </aside>
+
+  <div id="drop"><div>Rilascia qui i file GPX</div></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="app.js"></script>
+</body>
+</html>
