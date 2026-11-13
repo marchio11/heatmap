@@ -12,7 +12,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-  <link rel="stylesheet" href="style.css?v=11">
+  <link rel="stylesheet" href="style.css?v=13">
 </head>
 <body>
   <div id="map"></div>
@@ -20,7 +20,10 @@
   <aside id="panel">
     <header>
       <h1>🔥 Heatmap</h1>
-      <button id="toggle" class="icon" aria-label="Mostra/nascondi pannello">▾</button>
+      <div class="head-actions">
+        <button id="quickSync" class="icon" title="Sincronizza Drive" aria-label="Sincronizza Drive">⟳</button>
+        <button id="toggle" class="icon" aria-label="Mostra/nascondi pannello">▾</button>
+      </div>
     </header>
 
     <div class="body">
@@ -70,6 +73,6 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="app.js?v=11"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>

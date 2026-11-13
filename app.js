@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 4;
-const APP_VERSION = '12';
+const APP_VERSION = '13';
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
@@ -344,7 +344,7 @@ async function matchPending() {
       worked = true;
       let done = 0;
       for (const rec of todo) {
-        setStatus(`Aggancio i percorsi in auto alle strade… ${++done}/${todo.length}`);
+        setStatus(`Aggancio alle strade i percorsi in auto del ${dayLabel(rec.name)}…` + (todo.length > 1 ? ` (${++done}/${todo.length})` : ''));
         const segs = [];
         for (const pts of rec.segments) {
           const runs = [];
@@ -356,7 +356,7 @@ async function matchPending() {
         }
         // salva solo se nel frattempo il file non è stato aggiornato
         const fresh = await DB.get(rec.name);
-        if (fresh && fresh.modifiedTime === rec.modifiedTime) {
+        if (fresh && recVer(fresh) === recVer(rec)) {
           fresh.match = { v: MATCH_VERSION, pv: fresh.pv ?? null, n: fresh.segments.length, segs };
           await DB.put(fresh);
           if (fresh.source === 'drive') store.set('cacheDirty', '1');
@@ -812,7 +812,7 @@ window.addEventListener('drop', (e) => {
 let tokenClient = null;
 let token = null;
 try {
-  const saved = JSON.parse(sessionStorage.getItem('gtoken') || 'null');
+  const saved = JSON.parse(store.get('gtoken', 'null'));
   if (saved && saved.exp > Date.now() + 60000 && saved.scope) token = saved;
 } catch { /* ignora */ }
 
@@ -821,18 +821,30 @@ function getToken() {
     if (token && token.exp > Date.now() + 60000) return resolve(token.value);
     if (!window.google?.accounts?.oauth2) return reject(new Error('Libreria Google non ancora caricata, riprova tra un attimo.'));
     if (!tokenClient) {
-      tokenClient = google.accounts.oauth2.initTokenClient({ client_id: CONFIG.clientId, scope: CONFIG.scope, callback: () => {} });
+      // con l'account già noto Google non chiede più quale usare: la finestrella si apre e si chiude da sola
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: CONFIG.clientId, scope: CONFIG.scope, callback: () => {},
+        login_hint: store.get('ghint', '') || undefined,
+      });
     }
     tokenClient.callback = (resp) => {
       if (resp.error) return reject(new Error('Accesso non riuscito: ' + resp.error));
       token = { value: resp.access_token, exp: Date.now() + resp.expires_in * 1000, scope: resp.scope || '' };
-      try { sessionStorage.setItem('gtoken', JSON.stringify(token)); } catch { /* ignora */ }
+      store.set('gtoken', JSON.stringify(token));
+      store.set('gAuthorized', '1');
       resolve(token.value);
     };
     tokenClient.error_callback = (err) => reject(new Error(err?.type === 'popup_closed' ? 'Accesso annullato.' : 'Accesso non riuscito.'));
     tokenClient.requestAccessToken({ prompt: '' });
   });
 }
+
+const recVer = (r) => r.ver || r.modifiedTime;
+const fileVer = (f) => f.md5Checksum || f.modifiedTime;
+const dayLabel = (name) => {
+  const m = /(\d{4})(\d{2})(\d{2})/.exec(name);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]).toLocaleDateString('it-IT', { day: 'numeric', month: 'short' }) : name;
+};
 
 const tokenValid = () => !!token && token.exp > Date.now() + 60000;
 const canUseAppData = () => tokenValid() && /drive\.appdata/.test(token.scope);
@@ -843,7 +855,7 @@ async function drive(path, params, asText, opts = {}, base = 'https://www.google
   const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + token.value } });
   if (res.status === 401) {
     token = null;
-    try { sessionStorage.removeItem('gtoken'); } catch { /* ignora */ }
+    store.set('gtoken', 'null');
     throw new Error('Sessione Google scaduta: premi di nuovo il pulsante.');
   }
   if (!res.ok) throw new Error(`Errore Drive (${res.status})`);
@@ -889,7 +901,7 @@ async function applyRemoteCache() {
   for (const rec of await DB.all()) {
     if (rec.source !== 'drive' || matchValid(rec)) continue;
     const e = cache.entries[rec.name];
-    if (e && e.v === MATCH_VERSION && e.modifiedTime === rec.modifiedTime && e.pv === (rec.pv ?? null) &&
+    if (e && e.v === MATCH_VERSION && (e.ver || e.modifiedTime) === recVer(rec) && e.pv === (rec.pv ?? null) &&
         e.n === rec.segments.length) {
       rec.match = { v: e.v, pv: e.pv, n: e.n, segs: e.segs };
       await DB.put(rec);
@@ -906,7 +918,7 @@ async function uploadCache() {
   const cache = await downloadCache(file);
   for (const rec of await DB.all()) {
     if (rec.source !== 'drive' || !matchValid(rec)) continue;
-    cache.entries[rec.name] = { v: rec.match.v, pv: rec.match.pv, n: rec.match.n, modifiedTime: rec.modifiedTime, segs: rec.match.segs };
+    cache.entries[rec.name] = { v: rec.match.v, pv: rec.match.pv, n: rec.match.n, ver: recVer(rec), modifiedTime: rec.modifiedTime, segs: rec.match.segs };
   }
   if (getHome()) cache.home = getHome();
   cache.updated = new Date().toISOString();
@@ -929,11 +941,19 @@ async function uploadCache() {
 
 async function syncDrive() {
   const btn = $('sync');
+  if (btn.disabled) return;
   btn.disabled = true;
+  $('quickSync').classList.add('spinning');
   try {
     setStatus('Accesso a Google…');
     await getToken();
     btn.textContent = 'Sincronizza Drive';
+    if (!store.get('ghint', '')) {
+      try {
+        const about = await drive('about', { fields: 'user(emailAddress)' });
+        if (about.user?.emailAddress) store.set('ghint', about.user.emailAddress); // resta solo in questo browser
+      } catch { /* non indispensabile */ }
+    }
 
     const names = [folderInput.value.trim() || CONFIG.defaultFolder, ...CONFIG.fallbackFolders];
     let folders = [];
@@ -947,15 +967,17 @@ async function syncDrive() {
     setStatus('Cerco i file GPX…');
     let files = [];
     for (const f of folders) {
-      files.push(...await listAll(`'${f.id}' in parents and trashed = false and name contains '.gpx'`, 'id,name,modifiedTime'));
+      files.push(...await listAll(`'${f.id}' in parents and trashed = false and name contains '.gpx'`, 'id,name,modifiedTime,md5Checksum'));
     }
     files = files.filter((f) => /\.gpx$/i.test(f.name));
 
     const known = new Map((await DB.all()).map((r) => [r.name, r]));
     const todo = files.filter((f) => {
       const r = known.get(f.name);
-      return !r || r.source !== 'drive' || r.modifiedTime !== f.modifiedTime || r.pv !== PARSE_VERSION;
+      // si riscarica solo se il contenuto è cambiato davvero (GPSLogger a volte ricarica file identici)
+      return !r || r.source !== 'drive' || recVer(r) !== fileVer(f) || r.pv !== PARSE_VERSION;
     });
+    const updatedNames = todo.map((f) => dayLabel(f.name));
 
     let done = 0, bad = 0;
     const worker = async () => {
@@ -963,13 +985,13 @@ async function syncDrive() {
         const f = todo.shift();
         try {
           const text = await drive('files/' + f.id, { alt: 'media' }, true);
-          await DB.put({ name: f.name, source: 'drive', modifiedTime: f.modifiedTime, pv: PARSE_VERSION, segments: parseGpx(text) });
+          await DB.put({ name: f.name, source: 'drive', modifiedTime: f.modifiedTime, ver: fileVer(f), pv: PARSE_VERSION, segments: parseGpx(text) });
         } catch (err) {
           if (/Sessione Google scaduta/.test(err.message)) throw err;
           bad++;
         }
         done++;
-        setStatus(`Scarico i file… ${done}/${done + todo.length}`);
+        setStatus(`Scarico i file aggiornati… ${done}/${total}`);
       }
     };
     const total = todo.length;
@@ -978,16 +1000,20 @@ async function syncDrive() {
     try { await applyRemoteCache(); } catch { /* si aggancia da qui */ }
 
     await reloadFromDb(total > 0);
-    setStatus(`Sincronizzato: ${files.length} file su Drive, ${total} aggiornati` + (bad ? `, ${bad} con errori` : '') + '.');
+    setStatus(total
+      ? `Aggiornato: ${updatedNames.slice(0, 4).join(', ')}${total > 4 ? ` e altri ${total - 4}` : ''}` + (bad ? ` (${bad} con errori)` : '') + '.'
+      : 'Già tutto aggiornato ✓');
     store.set('lastSync', new Date().toISOString());
   } catch (err) {
     setStatus(err.message || 'Errore durante la sincronizzazione.', true);
   } finally {
     btn.disabled = false;
+    $('quickSync').classList.remove('spinning');
   }
 }
 
 $('sync').addEventListener('click', syncDrive);
+$('quickSync').addEventListener('click', (e) => { e.stopPropagation(); syncDrive(); });
 
 /* ---------------- Avvio ---------------- */
 
@@ -997,8 +1023,8 @@ $('sync').addEventListener('click', syncDrive);
   if (allSegments.length && window.innerWidth <= 600) $('panel').classList.add('collapsed');
   if (!allSegments.length) $('settings').open = true; // primo avvio: mostra subito i pulsanti
   if (!allSegments.length) setStatus('Accedi a Google Drive oppure trascina qui i tuoi file GPX.', false, true);
-  if (token) {
-    $('sync').textContent = 'Sincronizza Drive';
+  if (store.get('gAuthorized', '0') === '1') $('sync').textContent = 'Sincronizza Drive';
+  if (tokenValid()) {
     // sessione ancora valida: sincronizza da solo quando la libreria Google è pronta
     const wait = setInterval(() => {
       if (window.google?.accounts?.oauth2) { clearInterval(wait); syncDrive(); }
