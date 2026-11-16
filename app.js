@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 5;
-const APP_VERSION = '14';
+const APP_VERSION = '15';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -204,14 +204,13 @@ function classify(pts) {
   let lo = 0, hi = 0;
   for (let i = 0; i < legs.length; i++) {
     const leg = legs[i];
-    // Modo riconosciuto dal telefono (Heatlogger): ha la precedenza sulla stima dalla velocità
-    if (leg.act) {
-      const v = leg.act === 'vehicle' || leg.act === 'bicycle';
-      km[v ? 'vehicle' : 'walk'] += leg.d / 1000;
-      modes.push(v ? 'v' : 'w');
+    // Modo riconosciuto dal telefono (Heatlogger): ha la precedenza sulla stima dalla velocità.
+    // "Fermo" non dice con che mezzo ti muovi (al semaforo in auto è "fermo"): lì decide la velocità.
+    if (leg.act && leg.act !== 'still') {
+      modes.push(leg.act === 'vehicle' || leg.act === 'bicycle' ? 'v' : 'w');
       continue;
     }
-    if (leg.mid === null) { km.walk += leg.d / 1000; modes.push('w'); continue; }
+    if (leg.mid === null) { modes.push('w'); continue; }
     while (lo < i && (legs[lo].mid === null || legs[lo].mid < leg.mid - MODE_WINDOW_MS)) lo++;
     if (hi < i) hi = i;
     while (hi + 1 < legs.length && legs[hi + 1].mid !== null && legs[hi + 1].mid <= leg.mid + MODE_WINDOW_MS) hi++;
@@ -219,11 +218,34 @@ function classify(pts) {
     for (let j = lo; j <= hi; j++) if (legs[j].v !== null) speeds.push(legs[j].v);
     speeds.sort((x, y) => x - y);
     const p90 = speeds[Math.floor(0.9 * (speeds.length - 1))] || 0;
-    const isVehicle = p90 > VEHICLE_KMH;
-    km[isVehicle ? 'vehicle' : 'walk'] += leg.d / 1000;
-    modes.push(isVehicle ? 'v' : 'w');
+    modes.push(p90 > VEHICLE_KMH ? 'v' : 'w');
   }
+  smoothModes(pts, modes);
+  for (let i = 0; i < legs.length; i++) km[modes[i] === 'v' ? 'vehicle' : 'walk'] += legs[i].d / 1000;
   return { km, modes };
+}
+
+// Un pezzo di meno di 2 minuti in mezzo a due pezzi dello stesso tipo prende il loro tipo
+// (es. pochi secondi "a piedi" in auto). Stessa regola della dashboard Quantified Self.
+const MODE_BLIP_MS = 2 * 60 * 1000;
+function smoothModes(pts, modes) {
+  for (let changed = true; changed;) {
+    changed = false;
+    const runs = []; // [inizio, fine esclusa, modo]
+    for (let i = 0; i < modes.length; i++) {
+      if (runs.length && runs[runs.length - 1][2] === modes[i]) runs[runs.length - 1][1] = i + 1;
+      else runs.push([i, i + 1, modes[i]]);
+    }
+    for (let r = 1; r < runs.length - 1; r++) {
+      const [a, b, m] = runs[r];
+      if (runs[r - 1][2] !== runs[r + 1][2] || runs[r - 1][2] === m) continue;
+      const t0 = pts[a][2], t1 = pts[b][2]; // il tratto i va dal punto i al punto i+1
+      if (t0 === null || t1 === null || t1 - t0 >= MODE_BLIP_MS) continue;
+      for (let i = a; i < b; i++) modes[i] = runs[r - 1][2];
+      changed = true;
+      break;
+    }
+  }
 }
 
 // Gruppi consecutivi di tratti in veicolo, come indici dei punti [i0, i1]
@@ -253,7 +275,7 @@ function pathLength(pts, i0 = 0, i1 = pts.length - 1) {
 // Riceve solo le coordinate dei tratti in veicolo, una volta sola: il risultato resta nel browser.
 const OSRM_URL = 'https://router.project-osrm.org/match/v1/driving/';
 const OSRM_ROUTE_URL = 'https://router.project-osrm.org/route/v1/driving/';
-const MATCH_VERSION = 3;
+const MATCH_VERSION = 4;
 const MATCH_CHUNK = 90;   // il server accetta al massimo 100 punti per richiesta
 // metri di tolleranza intorno a ogni punto GPS: se un punto è troppo lontano da strade percorribili
 // in auto (parcheggi o strade private) il server rifiuta tutto, quindi si riprova allargando
