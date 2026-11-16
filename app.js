@@ -13,8 +13,11 @@ const CONFIG = {
 };
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
-const PARSE_VERSION = 4;
-const APP_VERSION = '13';
+const PARSE_VERSION = 5;
+const APP_VERSION = '14';
+// Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
+const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
+const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
 // Pulizia tracce
 const GAP_SPLIT_S = 5 * 60;   // oltre 5 minuti senza punti la traccia si interrompe
 const MAX_JUMP_KMH = 250;     // salti più veloci di così sono errori del GPS
@@ -124,11 +127,18 @@ function parseGpx(text) {
     const eleEl = el.getElementsByTagName('ele')[0];
     const t = timeEl ? Date.parse(timeEl.textContent) : NaN;
     const ele = eleEl ? parseFloat(eleEl.textContent) : NaN;
+    // Estensioni di Heatlogger: precisione, modo di spostamento e tipo di punto
+    const ext = (name) => el.getElementsByTagNameNS(HL_NS, name)[0]?.textContent?.trim() || null;
+    const acc = parseFloat(ext('acc'));
+    const kind = ext('kind');
+    if (kind === 'heartbeat') continue;            // battito durante le pause: non è uno spostamento
+    if (isFinite(acc) && acc > MAX_ACC_M) continue; // punto troppo impreciso per la mappa
     pts.push([
       Math.round(lat * 1e6) / 1e6,
       Math.round(lon * 1e6) / 1e6,
       isFinite(t) ? t : null,
       isFinite(ele) ? Math.round(ele * 10) / 10 : null,
+      ext('act'),
     ]);
   }
   if (pts.length && pts.every((p) => p[2] !== null)) pts.sort((a, b) => a[2] - b[2]);
@@ -187,13 +197,20 @@ function classify(pts) {
     const a = pts[i - 1], b = pts[i];
     const d = haversine(a, b);
     const dt = a[2] !== null && b[2] !== null ? (b[2] - a[2]) / 1000 : 0;
-    legs.push({ d, v: dt > 0 ? d / dt * 3.6 : null, mid: dt > 0 ? (a[2] + b[2]) / 2 : null });
+    legs.push({ d, v: dt > 0 ? d / dt * 3.6 : null, mid: dt > 0 ? (a[2] + b[2]) / 2 : null, act: b[4] || a[4] || null });
   }
   const km = { walk: 0, vehicle: 0 };
   const modes = []; // per ogni tratto: 'w' a piedi, 'v' veicolo
   let lo = 0, hi = 0;
   for (let i = 0; i < legs.length; i++) {
     const leg = legs[i];
+    // Modo riconosciuto dal telefono (Heatlogger): ha la precedenza sulla stima dalla velocità
+    if (leg.act) {
+      const v = leg.act === 'vehicle' || leg.act === 'bicycle';
+      km[v ? 'vehicle' : 'walk'] += leg.d / 1000;
+      modes.push(v ? 'v' : 'w');
+      continue;
+    }
     if (leg.mid === null) { km.walk += leg.d / 1000; modes.push('w'); continue; }
     while (lo < i && (legs[lo].mid === null || legs[lo].mid < leg.mid - MODE_WINDOW_MS)) lo++;
     if (hi < i) hi = i;
