@@ -13,8 +13,8 @@ const CONFIG = {
 };
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
-const PARSE_VERSION = 5;
-const APP_VERSION = '15';
+const PARSE_VERSION = 6;
+const APP_VERSION = '16';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -27,6 +27,7 @@ const PARK_MAX_M = 500;       // sosta con l'auto: se prima e dopo ci si muoveva
 const PARK_MAX_S = 12 * 3600; // a meno di 500 m da dove ci si era fermati, i punti restano collegati
 // Piedi / veicolo
 const VEHICLE_KMH = 25;       // sopra questa velocità "di punta" è un veicolo
+const WALK_MAX_KMH = 10; // "in auto" sotto questa velocità per minuti: in realtà a piedi
 const MODE_WINDOW_MS = 3 * 60 * 1000; // finestra di ±3 minuti per decidere
 // Disegno
 const STEP = 6;               // intensità aggiunta da ogni passaggio (0-255)
@@ -133,16 +134,46 @@ function parseGpx(text) {
     const kind = ext('kind');
     if (kind === 'heartbeat') continue;            // battito durante le pause: non è uno spostamento
     if (isFinite(acc) && acc > MAX_ACC_M) continue; // punto troppo impreciso per la mappa
+    const spd = parseFloat(ext('spd'));
     pts.push([
       Math.round(lat * 1e6) / 1e6,
       Math.round(lon * 1e6) / 1e6,
       isFinite(t) ? t : null,
       isFinite(ele) ? Math.round(ele * 10) / 10 : null,
       ext('act'),
+      isFinite(spd) ? Math.round(spd * 36) / 10 : null, // velocità misurata dal GPS, km/h
+      isFinite(acc) ? acc : null,
     ]);
   }
   if (pts.length && pts.every((p) => p[2] !== null)) pts.sort((a, b) => a[2] - b[2]);
-  return splitSegment(pts);
+  return splitSegment(dedupClose(pts));
+}
+
+// Due punti a pochi secondi di distanza (Heatlogger ne chiede uno migliore quando il primo è
+// impreciso): tengo il più preciso. Il rumore tra i due darebbe velocità assurde e falsi "salti".
+const CLOSE_S = 8;
+function dedupClose(pts) {
+  const out = [];
+  for (const p of pts) {
+    const prev = out[out.length - 1];
+    if (prev && p[2] !== null && prev[2] !== null && p[2] - prev[2] < CLOSE_S * 1000) {
+      if ((p[6] ?? 99) < (prev[6] ?? 99)) out[out.length - 1] = p;
+      continue;
+    }
+    out.push(p);
+  }
+  // Punti "a zigzag": vanno e tornano di decine di metri mentre il GPS dice che sei quasi fermo
+  for (let changed = true; changed;) {
+    changed = false;
+    for (let i = 1; i < out.length - 1; i++) {
+      const a = out[i - 1], p = out[i], b = out[i + 1];
+      if (p[5] === null || p[5] > 15) continue; // solo a passo d'uomo con velocità misurata
+      const da = haversine(a, p), db = haversine(p, b), ab = haversine(a, b);
+      if (da > 40 && db > 40 && ab < 0.5 * Math.min(da, db)) { out.splice(i, 1); changed = true; i--; }
+    }
+  }
+  for (const p of out) p.length = 6; // la precisione serviva solo qui
+  return out;
 }
 
 // Divide la traccia dove ci sono pause lunghe o salti impossibili del GPS.
@@ -197,20 +228,29 @@ function classify(pts) {
     const a = pts[i - 1], b = pts[i];
     const d = haversine(a, b);
     const dt = a[2] !== null && b[2] !== null ? (b[2] - a[2]) / 1000 : 0;
-    legs.push({ d, v: dt > 0 ? d / dt * 3.6 : null, mid: dt > 0 ? (a[2] + b[2]) / 2 : null, act: b[4] || a[4] || null });
+    // Velocità: quella misurata dal GPS (Heatlogger) è molto più affidabile di distanza/tempo
+    const v = b[5] ?? (dt > 0 ? d / dt * 3.6 : null);
+    legs.push({ d, v: dt > 0 ? v : null, mid: dt > 0 ? (a[2] + b[2]) / 2 : null, act: b[4] || a[4] || null });
   }
   const km = { walk: 0, vehicle: 0 };
+  // A piedi il rumore del GPS allunga molto la traccia: se c'è la velocità misurata,
+  // un tratto non può essere più lungo di quanto quella velocità permette (con margine)
+  const walkLen = (i) => {
+    const a = pts[i], b = pts[i + 1], leg = legs[i];
+    if (a[5] === null || b[5] === null || a[2] === null || b[2] === null) return leg.d;
+    const max = Math.max(a[5], b[5]) / 3.6 * (b[2] - a[2]) / 1000 * 1.5 + 10;
+    return Math.min(leg.d, max);
+  };
   const modes = []; // per ogni tratto: 'w' a piedi, 'v' veicolo
   let lo = 0, hi = 0;
   for (let i = 0; i < legs.length; i++) {
     const leg = legs[i];
     // Modo riconosciuto dal telefono (Heatlogger): ha la precedenza sulla stima dalla velocità.
     // "Fermo" non dice con che mezzo ti muovi (al semaforo in auto è "fermo"): lì decide la velocità.
-    if (leg.act && leg.act !== 'still') {
-      modes.push(leg.act === 'vehicle' || leg.act === 'bicycle' ? 'v' : 'w');
-      continue;
-    }
-    if (leg.mid === null) { modes.push('w'); continue; }
+    const onFoot = leg.act === 'walking' || leg.act === 'running';
+    const inVehicle = leg.act === 'vehicle' || leg.act === 'bicycle';
+    if (onFoot) { modes.push('w'); continue; }
+    if (leg.mid === null) { modes.push(inVehicle ? 'v' : 'w'); continue; }
     while (lo < i && (legs[lo].mid === null || legs[lo].mid < leg.mid - MODE_WINDOW_MS)) lo++;
     if (hi < i) hi = i;
     while (hi + 1 < legs.length && legs[hi + 1].mid !== null && legs[hi + 1].mid <= leg.mid + MODE_WINDOW_MS) hi++;
@@ -218,10 +258,15 @@ function classify(pts) {
     for (let j = lo; j <= hi; j++) if (legs[j].v !== null) speeds.push(legs[j].v);
     speeds.sort((x, y) => x - y);
     const p90 = speeds[Math.floor(0.9 * (speeds.length - 1))] || 0;
-    modes.push(p90 > VEHICLE_KMH ? 'v' : 'w');
+    // "In auto" ma per minuti a passo d'uomo: il telefono si è sbagliato (es. 17/11, passeggiata
+    // rimasta "in auto"). In coda o al semaforo i ±3 minuti contengono anche tratti più veloci.
+    modes.push(inVehicle ? (p90 < WALK_MAX_KMH ? 'w' : 'v') : (p90 > VEHICLE_KMH ? 'v' : 'w'));
   }
   smoothModes(pts, modes);
-  for (let i = 0; i < legs.length; i++) km[modes[i] === 'v' ? 'vehicle' : 'walk'] += legs[i].d / 1000;
+  for (let i = 0; i < legs.length; i++) {
+    if (modes[i] === 'v') km.vehicle += legs[i].d / 1000;
+    else km.walk += walkLen(i) / 1000;
+  }
   return { km, modes };
 }
 
@@ -275,7 +320,7 @@ function pathLength(pts, i0 = 0, i1 = pts.length - 1) {
 // Riceve solo le coordinate dei tratti in veicolo, una volta sola: il risultato resta nel browser.
 const OSRM_URL = 'https://router.project-osrm.org/match/v1/driving/';
 const OSRM_ROUTE_URL = 'https://router.project-osrm.org/route/v1/driving/';
-const MATCH_VERSION = 4;
+const MATCH_VERSION = 5;
 const MATCH_CHUNK = 90;   // il server accetta al massimo 100 punti per richiesta
 // metri di tolleranza intorno a ogni punto GPS: se un punto è troppo lontano da strade percorribili
 // in auto (parcheggi o strade private) il server rifiuta tutto, quindi si riprova allargando
