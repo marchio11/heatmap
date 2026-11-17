@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 6;
-const APP_VERSION = '16';
+const APP_VERSION = '17';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -27,7 +27,6 @@ const PARK_MAX_M = 500;       // sosta con l'auto: se prima e dopo ci si muoveva
 const PARK_MAX_S = 12 * 3600; // a meno di 500 m da dove ci si era fermati, i punti restano collegati
 // Piedi / veicolo
 const VEHICLE_KMH = 25;       // sopra questa velocità "di punta" è un veicolo
-const WALK_MAX_KMH = 10; // "in auto" sotto questa velocità per minuti: in realtà a piedi
 const MODE_WINDOW_MS = 3 * 60 * 1000; // finestra di ±3 minuti per decidere
 // Disegno
 const STEP = 6;               // intensità aggiunta da ogni passaggio (0-255)
@@ -250,7 +249,8 @@ function classify(pts) {
     const onFoot = leg.act === 'walking' || leg.act === 'running';
     const inVehicle = leg.act === 'vehicle' || leg.act === 'bicycle';
     if (onFoot) { modes.push('w'); continue; }
-    if (leg.mid === null) { modes.push(inVehicle ? 'v' : 'w'); continue; }
+    if (inVehicle) { modes.push('v'); continue; } // anche se lenta: coda, camper in salita
+    if (leg.mid === null) { modes.push('w'); continue; }
     while (lo < i && (legs[lo].mid === null || legs[lo].mid < leg.mid - MODE_WINDOW_MS)) lo++;
     if (hi < i) hi = i;
     while (hi + 1 < legs.length && legs[hi + 1].mid !== null && legs[hi + 1].mid <= leg.mid + MODE_WINDOW_MS) hi++;
@@ -258,9 +258,7 @@ function classify(pts) {
     for (let j = lo; j <= hi; j++) if (legs[j].v !== null) speeds.push(legs[j].v);
     speeds.sort((x, y) => x - y);
     const p90 = speeds[Math.floor(0.9 * (speeds.length - 1))] || 0;
-    // "In auto" ma per minuti a passo d'uomo: il telefono si è sbagliato (es. 17/11, passeggiata
-    // rimasta "in auto"). In coda o al semaforo i ±3 minuti contengono anche tratti più veloci.
-    modes.push(inVehicle ? (p90 < WALK_MAX_KMH ? 'w' : 'v') : (p90 > VEHICLE_KMH ? 'v' : 'w'));
+    modes.push(p90 > VEHICLE_KMH ? 'v' : 'w');
   }
   smoothModes(pts, modes);
   for (let i = 0; i < legs.length; i++) {
@@ -320,7 +318,7 @@ function pathLength(pts, i0 = 0, i1 = pts.length - 1) {
 // Riceve solo le coordinate dei tratti in veicolo, una volta sola: il risultato resta nel browser.
 const OSRM_URL = 'https://router.project-osrm.org/match/v1/driving/';
 const OSRM_ROUTE_URL = 'https://router.project-osrm.org/route/v1/driving/';
-const MATCH_VERSION = 5;
+const MATCH_VERSION = 6;
 const MATCH_CHUNK = 90;   // il server accetta al massimo 100 punti per richiesta
 // metri di tolleranza intorno a ogni punto GPS: se un punto è troppo lontano da strade percorribili
 // in auto (parcheggi o strade private) il server rifiuta tutto, quindi si riprova allargando
