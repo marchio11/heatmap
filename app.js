@@ -13,8 +13,8 @@ const CONFIG = {
 };
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
-const PARSE_VERSION = 6;
-const APP_VERSION = '17';
+const PARSE_VERSION = 7;
+const APP_VERSION = '18';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -161,14 +161,38 @@ function dedupClose(pts) {
     }
     out.push(p);
   }
-  // Punti "a zigzag": vanno e tornano di decine di metri mentre il GPS dice che sei quasi fermo
+  // Punti "a zigzag": vanno e tornano di decine di metri e il punto dopo torna vicino a quello
+  // prima (es. 17/11 a Pesaro, salti di 200 m avanti e indietro ogni 50 s)
   for (let changed = true; changed;) {
     changed = false;
     for (let i = 1; i < out.length - 1; i++) {
       const a = out[i - 1], p = out[i], b = out[i + 1];
-      if (p[5] === null || p[5] > 15) continue; // solo a passo d'uomo con velocità misurata
+      if (p[5] !== null && p[5] > 15) continue; // il GPS dice che si va veloci: non è rumore
+      if (a[2] === null || b[2] === null || b[2] - a[2] > 4 * 60 * 1000) continue;
+      // Senza velocità misurata (GPSLogger) serve un salto più netto per essere sicuri
+      const min = p[5] === null ? 60 : 40;
       const da = haversine(a, p), db = haversine(p, b), ab = haversine(a, b);
-      if (da > 40 && db > 40 && ab < 0.5 * Math.min(da, db)) { out.splice(i, 1); changed = true; i--; }
+      if (da > min && db > min && ab < 0.5 * Math.min(da, db)) { out.splice(i, 1); changed = true; i--; }
+    }
+  }
+  // "Escursioni" impossibili: da un punto la traccia salta lontano per 1-3 punti a una velocità
+  // da corsa e poi torna lì vicino. A piedi è il GPS che rimbalza tra due posizioni (riflessi su
+  // edifici e porto); un vero andare e tornare a passo d'uomo non supera i 9 km/h e resta.
+  for (let i = 1; i < out.length - 1; i++) {
+    const a = out[i - 1];
+    if (a[2] === null) continue;
+    for (let j = i; j < Math.min(i + 3, out.length - 1); j++) {
+      const exc = out.slice(i, j + 1), b = out[j + 1];
+      const first = out[i];
+      const ok = first[2] > a[2] && haversine(a, first) / ((first[2] - a[2]) / 1000) * 3.6 > 9 &&
+        exc.every((p) => p[2] !== null && (p[5] === null || p[5] <= 15) && haversine(a, p) > 60);
+      if (!ok) break;
+      const far = Math.min(...exc.map((p) => haversine(a, p)));
+      if (b[2] !== null && b[2] - a[2] < 4 * 60 * 1000 && haversine(a, b) < Math.max(40, 0.4 * far)) {
+        out.splice(i, j - i + 1);
+        i--;
+        break;
+      }
     }
   }
   for (const p of out) p.length = 6; // la precisione serviva solo qui
@@ -318,7 +342,7 @@ function pathLength(pts, i0 = 0, i1 = pts.length - 1) {
 // Riceve solo le coordinate dei tratti in veicolo, una volta sola: il risultato resta nel browser.
 const OSRM_URL = 'https://router.project-osrm.org/match/v1/driving/';
 const OSRM_ROUTE_URL = 'https://router.project-osrm.org/route/v1/driving/';
-const MATCH_VERSION = 6;
+const MATCH_VERSION = 7;
 const MATCH_CHUNK = 90;   // il server accetta al massimo 100 punti per richiesta
 // metri di tolleranza intorno a ogni punto GPS: se un punto è troppo lontano da strade percorribili
 // in auto (parcheggi o strade private) il server rifiuta tutto, quindi si riprova allargando
