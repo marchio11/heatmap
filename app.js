@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '19';
+const APP_VERSION = '20';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -439,24 +439,46 @@ function matchValid(rec) {
 
 let matching = false;
 
+// Ogni tratto in auto ha una "firma" (inizio, fine, numero di punti): se un file viene riscaricato
+// (es. quello di oggi, che GPSLogger aggiorna ogni ora) i tratti già agganciati si riusano
+// invece di richiederli al server. Va cambiato MATCH_ALGO solo se cambia il modo di agganciare.
+const MATCH_ALGO = 1;
+const runKey = (p) => `${MATCH_ALGO}|${p[0][2]}|${p[p.length - 1][2]}|${p.length}|${p[0][0]},${p[0][1]}`;
+
+function knownRuns(records) {
+  const known = new Map();
+  for (const r of records) {
+    const runs = [...(r.match?.segs || []).flat(), ...(r.oldRuns || [])];
+    for (const run of runs) if (run && run.k && run.coords) known.set(run.k, run);
+  }
+  return known;
+}
+
 async function matchPending() {
   if (matching || !snapEnabled()) return;
   matching = true;
   let worked = false;
   try {
     for (;;) {
-      const todo = (await DB.all()).filter((r) => !matchValid(r));
+      const all = await DB.all();
+      const todo = all.filter((r) => !matchValid(r));
       if (!todo.length) break;
-      worked = true;
+      const known = knownRuns(all);
       let done = 0;
       for (const rec of todo) {
-        setStatus(`Aggancio alle strade i percorsi in auto del ${dayLabel(rec.name)}…` + (todo.length > 1 ? ` (${++done}/${todo.length})` : ''));
+        done++;
         const segs = [];
         for (const pts of rec.segments) {
           const runs = [];
           for (const [i0, i1] of vehicleRuns(classify(pts).modes)) {
-            const { coords, why } = await matchRun(pts.slice(i0, i1 + 1));
-            runs.push({ i0, i1, coords, why, dist: coords ? pathLength(coords) : null });
+            const part = pts.slice(i0, i1 + 1);
+            const k = runKey(part);
+            const old = known.get(k);
+            if (old) { runs.push({ i0, i1, k, coords: old.coords, why: null, dist: old.dist }); continue; }
+            worked = true;
+            setStatus(`Aggancio alle strade i percorsi in auto del ${dayLabel(rec.name)}…` + (todo.length > 1 ? ` (${done}/${todo.length})` : ''));
+            const { coords, why } = await matchRun(part);
+            runs.push({ i0, i1, k, coords, why, dist: coords ? pathLength(coords) : null });
           }
           segs.push(runs);
         }
@@ -464,6 +486,7 @@ async function matchPending() {
         const fresh = await DB.get(rec.name);
         if (fresh && recVer(fresh) === recVer(rec)) {
           fresh.match = { v: MATCH_VERSION, pv: fresh.pv ?? null, n: fresh.segments.length, segs };
+          delete fresh.oldRuns;
           await DB.put(fresh);
           if (fresh.source === 'drive') store.set('cacheDirty', '1');
         }
@@ -1132,7 +1155,10 @@ async function syncDrive() {
         const f = todo.shift();
         try {
           const text = await drive('files/' + f.id, { alt: 'media' }, true);
-          await DB.put({ name: f.name, source: 'drive', modifiedTime: f.modifiedTime, ver: fileVer(f), pv: PARSE_VERSION, segments: parseGpx(text) });
+          // i tratti già agganciati della versione precedente del file restano a disposizione
+          const prev = known.get(f.name);
+          const oldRuns = [...(prev?.match?.segs || []).flat(), ...(prev?.oldRuns || [])].filter((r) => r && r.k && r.coords);
+          await DB.put({ name: f.name, source: 'drive', modifiedTime: f.modifiedTime, ver: fileVer(f), pv: PARSE_VERSION, segments: parseGpx(text), oldRuns });
         } catch (err) {
           if (/Sessione Google scaduta/.test(err.message)) throw err;
           bad++;
