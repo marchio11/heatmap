@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '28';
+const APP_VERSION = '29';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -687,7 +687,7 @@ function parseTimeline(text) {
   for (const sg of segsIn) {
     for (const q of sg.timelinePath || []) {
       const p = ll(q.point), t = Date.parse(q.time);
-      if (p && isFinite(t)) path.push([p[0], p[1], t]);
+      if (p && isFinite(t)) path.push([p[0], p[1], t, String(q.time).slice(0, 10).replace(/-/g, '')]);
     }
   }
   path.sort((a, b) => a[2] - b[2]);
@@ -716,6 +716,57 @@ function parseTimeline(text) {
     if (clean.length < 2) continue;
     const day = sg.startTime.slice(0, 10).replace(/-/g, '');
     for (const part of splitTrip(clean)) {
+      if (!days.has(day)) days.set(day, []);
+      days.get(day).push(part);
+      trips++;
+    }
+  }
+  // Tragitti "orfani": punti che Google non ha messo in nessuna attività (es. 13/6, da Falzarego
+  // al Giau dentro una "visita") ma che si muovono come un'auto. Recuperati con regole prudenti.
+  const spans = [];
+  for (const sg of segsIn) {
+    const t0 = Date.parse(sg.startTime), t1 = Date.parse(sg.endTime);
+    if (sg.activity && isFinite(t0) && isFinite(t1) && t1 - t0 >= 60000) spans.push([t0 - 60000, t1 + 60000]);
+  }
+  spans.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const sp of spans) {
+    const last = merged[merged.length - 1];
+    if (last && sp[0] <= last[1]) last[1] = Math.max(last[1], sp[1]); else merged.push(sp.slice());
+  }
+  let m = 0;
+  const groups = [];
+  let cur = [];
+  for (const p of path) {
+    while (m < merged.length && merged[m][1] < p[2]) m++;
+    if (m < merged.length && merged[m][0] <= p[2]) continue; // dentro un'attività: già considerato
+    const prev = cur[cur.length - 1];
+    if (prev && p[2] - prev[2] > 10 * 60000) { groups.push(cur); cur = []; }
+    if (!prev || prev[0] !== p[0] || prev[1] !== p[1]) cur.push(p);
+  }
+  groups.push(cur);
+  for (const g of groups) {
+    if (g.length < 3) continue;
+    const clean = [];
+    for (const p of g) {
+      const prev = clean[clean.length - 1];
+      if (prev && p[2] - prev[2] < 1000) continue;
+      clean.push([Math.round(p[0] * 1e6) / 1e6, Math.round(p[1] * 1e6) / 1e6, p[2], null, 'vehicle', null]);
+    }
+    cleanTrip(clean);
+    if (clean.length < 3) continue;
+    for (const part of splitTrip(clean)) {
+      const sp = [];
+      for (let i = 1; i < part.length; i++) {
+        const kmh = haversine(part[i - 1], part[i]) / Math.max(1, (part[i][2] - part[i - 1][2]) / 1000) * 3.6;
+        if (kmh > 3) sp.push(kmh);
+      }
+      sp.sort((a, b) => a - b);
+      const med = sp.length ? sp[sp.length >> 1] : 0;
+      const reach = Math.max(...part.map((p) => haversine(part[0], p))); // rimbalzi sul posto: non ci si allontana
+      if (part.length < 3 || pathLength(part) < 2000 || reach < 1000 || med < 20 || med > 140) continue; // a piedi, treno, aereo…
+      const first = g.find((p) => p[2] === part[0][2]);
+      const day = first ? first[3] : new Date(part[0][2]).toISOString().slice(0, 10).replace(/-/g, '');
       if (!days.has(day)) days.set(day, []);
       days.get(day).push(part);
       trips++;
