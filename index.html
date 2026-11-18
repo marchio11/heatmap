@@ -12,7 +12,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-  <link rel="stylesheet" href="style.css?v=18">
+  <link rel="stylesheet" href="style.css?v=19">
 </head>
 <body>
   <div id="map"></div>
@@ -33,8 +33,8 @@
       </label>
 
       <div class="stats">
-        <div><span class="lbl">🚶 A piedi</span><span id="kmWalk" class="val">–</span></div>
-        <div><span class="lbl">🚗 Veicoli</span><span id="kmVehicle" class="val">–</span></div>
+        <label class="toggle" title="Mostra o nascondi sulla mappa"><span class="lbl"><input id="showWalk" type="checkbox" checked> 🚶 A piedi</span><span id="kmWalk" class="val">–</span></label>
+        <label class="toggle" title="Mostra o nascondi sulla mappa"><span class="lbl"><input id="showVehicle" type="checkbox" checked> 🚗 Veicoli</span><span id="kmVehicle" class="val">–</span></label>
         <div><span class="lbl">📅 Giorni registrati</span><span id="days" class="val">–</span></div>
         <div id="recHigh" class="rec" title="Mostra sulla mappa"><span class="lbl">⛰️ Punto più alto</span><span id="high" class="val">–</span></div>
         <div id="recFar" class="rec" title="Mostra sulla mappa"><span class="lbl">📍 Più lontano da casa</span><span id="far" class="val">–</span></div>
@@ -73,6 +73,6 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="app.js?v=18"></script>
+  <script src="app.js?v=19"></script>
 </body>
 </html>

@@ -73,7 +73,10 @@ select, input[type="text"] {
   background: rgba(255, 255, 255, 0.04);
   border-radius: 10px;
 }
-.stats div { display: flex; justify-content: space-between; }
+.stats div, .stats .toggle { display: flex; justify-content: space-between; }
+.stats .toggle { cursor: pointer; }
+.stats .toggle input { accent-color: var(--accent); margin: 0 4px 0 0; vertical-align: -2px; }
+.stats .toggle:has(input:not(:checked)) .val { opacity: 0.4; }
 .stats .lbl { color: var(--muted); }
 .stats .val { font-variant-numeric: tabular-nums; font-weight: 600; }
 

@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '18';
+const APP_VERSION = '19';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -488,6 +488,49 @@ async function matchPending() {
 
 let allSegments = [];
 
+function bboxOf(path) {
+  let minLat = 90, minLon = 180, maxLat = -90, maxLon = -180;
+  for (const p of path) {
+    if (p[0] < minLat) minLat = p[0];
+    if (p[0] > maxLat) maxLat = p[0];
+    if (p[1] < minLon) minLon = p[1];
+    if (p[1] > maxLon) maxLon = p[1];
+  }
+  return [minLat, minLon, maxLat, maxLon];
+}
+
+// Divide una traccia in pezzi "a piedi" e "in veicolo" (per il filtro della mappa).
+// Nei pezzi in veicolo i tratti agganciati alle strade sostituiscono i punti GPS.
+function splitByMode(pts, modes, runs, day) {
+  const pieces = [];
+  let s = 0;
+  for (let i = 1; i <= modes.length; i++) {
+    if (i < modes.length && modes[i] === modes[s]) continue;
+    const e = i; // pezzo dai punti s..e (tratti s..e-1)
+    const m = modes[s] === 'v' ? 'v' : 'w';
+    let path = [];
+    if (m === 'v' && runs && runs.length) {
+      let j = s;
+      for (const r of runs) {
+        if (!r.coords || r.i0 < s || r.i1 > e || r.i0 < j) continue;
+        while (j < r.i0) path.push(pts[j++]);
+        path.push(...r.coords);
+        j = r.i1 + 1;
+      }
+      while (j <= e) path.push(pts[j++]);
+    } else {
+      path = pts.slice(s, e + 1);
+    }
+    if (path.length >= 2) pieces.push({ m, path, day, bbox: bboxOf(path) });
+    s = i;
+  }
+  return pieces;
+}
+
+// Filtro della mappa: a piedi / in veicolo (all'apertura sempre entrambi)
+const show = { w: true, v: true };
+const visiblePieces = (segs) => segs.flatMap((s) => s.pieces.filter((p) => show[p.m]));
+
 function buildIndex(records) {
   const segs = [];
   for (const rec of records) {
@@ -503,7 +546,7 @@ function buildIndex(records) {
       } else {
         day = 'senza data';
       }
-      const { km } = classify(pts);
+      const { km, modes } = classify(pts);
       let path = pts;
       let runs = matched && matched[k];
       // protezione: un aggancio che non corrisponde ai punti viene ignorato (verrà rifatto)
@@ -524,19 +567,13 @@ function buildIndex(records) {
         }
         while (i < pts.length) path.push(pts[i++]);
       }
-      let minLat = 90, minLon = 180, maxLat = -90, maxLon = -180;
-      for (const p of path) {
-        if (p[0] < minLat) minLat = p[0];
-        if (p[0] > maxLat) maxLat = p[0];
-        if (p[1] < minLon) minLon = p[1];
-        if (p[1] > maxLon) maxLon = p[1];
-      }
       segs.push({
         path,
+        pieces: splitByMode(pts, modes, runs, day),
         runs: runs || [],
         day,
         year: day.slice(0, 4),
-        bbox: [minLat, minLon, maxLat, maxLon],
+        bbox: bboxOf(path),
         km,
       });
     });
@@ -746,7 +783,7 @@ function renderRecords() {
   recLayer.clearLayers();
   const home = getHome();
   let high = null, far = null;
-  for (const seg of currentSegments()) {
+  for (const seg of visiblePieces(currentSegments())) {
     for (const p of seg.path) {
       const e = elevCache[cellKey(p)];
       if (e !== undefined && (!high || e > high.e)) high = { e, p, day: seg.day };
@@ -816,7 +853,7 @@ function refreshYears() {
 
 function render(fit) {
   const segs = currentSegments();
-  heat.setSegments(segs);
+  heat.setSegments(visiblePieces(segs));
 
   let walk = 0, vehicle = 0;
   const days = new Set();
@@ -862,6 +899,10 @@ async function reloadFromDb(fit) {
 }
 
 $('ver').textContent = APP_VERSION;
+
+for (const [id, m] of [['showWalk', 'w'], ['showVehicle', 'v']]) {
+  $(id).addEventListener('change', (e) => { show[m] = e.target.checked; render(false); });
+}
 
 $('year').addEventListener('change', () => { store.set('year', $('year').value); render(true); });
 $('toggle').addEventListener('click', () => $('panel').classList.toggle('collapsed'));
