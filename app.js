@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '27';
+const APP_VERSION = '28';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -614,7 +614,7 @@ const TL_VEHICLES = new Set(['IN_PASSENGER_VEHICLE', 'IN_VEHICLE', 'IN_CAR', 'DR
 
 // Pulizia di un viaggio della Cronologia (modifica l'array). Se cambia, alzare TL_CLEAN:
 // i viaggi già caricati vengono ripuliti da soli all'apertura.
-const TL_CLEAN = 2;
+const TL_CLEAN = 3;
 function cleanTrip(clean) {
   const v = (x, y) => haversine(x, y) / Math.max(1, (y[2] - x[2]) / 1000) * 3.6;
   for (let changed = true; changed;) {
@@ -632,14 +632,43 @@ function cleanTrip(clean) {
       }
     }
   }
+  // 3) primo o ultimo punto irraggiungibile (es. 12/7: "fine viaggio" al parcheggio, a 575 km/h)
+  while (clean.length > 2 && v(clean[clean.length - 2], clean[clean.length - 1]) > 180) clean.pop();
+  while (clean.length > 2 && v(clean[0], clean[1]) > 180) clean.shift();
   return clean;
+}
+
+// Un "viaggio" con dentro una sosta lunga (es. notte in camper al passo) si divide in due;
+// i pezzi corti attaccati alla sosta sono quasi sempre a piedi (si parte per un sentiero)
+const STOP_MS = 20 * 60 * 1000, STOP_M = 200, AFTER_STOP_MIN_M = 2000;
+function splitTrip(trip) {
+  const parts = [];
+  let cur = [trip[0]];
+  for (let i = 1; i < trip.length; i++) {
+    // sosta: dal punto i in avanti si resta entro 200 m per almeno 20 minuti
+    let j = i;
+    while (j + 1 < trip.length && haversine(trip[i], trip[j + 1]) <= STOP_M) j++;
+    if (j > i && trip[j][2] - trip[i][2] >= STOP_MS) {
+      cur.push(trip[i]);
+      parts.push({ pts: cur, stopAfter: true });
+      cur = [trip[j]];
+      i = j;
+      continue;
+    }
+    cur.push(trip[i]);
+  }
+  parts.push({ pts: cur, stopAfter: false });
+  return parts.filter((pc, n) => {
+    const nearStop = pc.stopAfter || n > 0;
+    return pc.pts.length >= 2 && pathLength(pc.pts) >= (parts.length > 1 && nearStop ? AFTER_STOP_MIN_M : 300);
+  }).map((pc) => pc.pts);
 }
 
 // Ripulisce i viaggi caricati con una versione precedente della pulizia
 async function upgradeTimeline() {
   for (const rec of await DB.all()) {
     if (rec.source !== 'timeline' || (rec.tlv || 1) >= TL_CLEAN) continue;
-    const segments = rec.segments.map((t) => cleanTrip(t.slice())).filter((t) => t.length >= 2 && pathLength(t) >= 300);
+    const segments = rec.segments.flatMap((t) => { const c = cleanTrip(t.slice()); return c.length >= 2 ? splitTrip(c) : []; });
     const oldRuns = [...(rec.match?.segs || []).flat(), ...(rec.oldRuns || [])].filter((r) => r && r.k && r.coords);
     if (!segments.length) { await DB.del(rec.name); continue; }
     await DB.put({ name: rec.name, source: 'timeline', ver: rec.ver + '+c' + TL_CLEAN, modifiedTime: rec.modifiedTime, pv: rec.pv, tlv: TL_CLEAN, segments, oldRuns });
@@ -684,11 +713,13 @@ function parseTimeline(text) {
       clean.push([Math.round(p[0] * 1e6) / 1e6, Math.round(p[1] * 1e6) / 1e6, p[2], null, 'vehicle', null]);
     }
     cleanTrip(clean);
-    if (clean.length < 2 || pathLength(clean) < 300) continue;
+    if (clean.length < 2) continue;
     const day = sg.startTime.slice(0, 10).replace(/-/g, '');
-    if (!days.has(day)) days.set(day, []);
-    days.get(day).push(clean);
-    trips++;
+    for (const part of splitTrip(clean)) {
+      if (!days.has(day)) days.set(day, []);
+      days.get(day).push(part);
+      trips++;
+    }
   }
   return { days, trips };
 }
