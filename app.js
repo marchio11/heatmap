@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '24';
+const APP_VERSION = '25';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -724,7 +724,8 @@ function buildIndex(records) {
         path,
         timeline,
         raw: timeline ? pts : null,
-        pieces: splitByMode(pts, modes, runs, day),
+        // Cronologia: le quote sono chieste per i punti veri, non per i percorsi ricostruiti
+        pieces: splitByMode(pts, modes, runs, day).map((pc) => timeline ? { ...pc, elev: pts } : pc),
         runs: runs || [],
         day,
         year: day.slice(0, 4),
@@ -949,9 +950,11 @@ function renderRecords() {
   const home = getHome();
   let high = null, far = null;
   for (const seg of visiblePieces(currentSegments())) {
-    for (const p of seg.path) {
+    for (const p of seg.elev || seg.path) {
       const e = elevCache[cellKey(p)];
       if (e !== undefined && (!high || e > high.e)) high = { e, p, day: seg.day };
+    }
+    for (const p of seg.path) {
       if (home) {
         const d = haversine(home, p);
         if (!far || d > far.d) far = { d, p, day: seg.day };
