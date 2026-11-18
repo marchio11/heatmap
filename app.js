@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '22';
+const APP_VERSION = '23';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -460,6 +460,26 @@ function matchValid(rec) {
 }
 
 let matching = false;
+let matchRetry = null;
+
+// Durante un aggancio lungo (es. Cronologia Google) tiene lo schermo acceso:
+// a schermo spento il telefono sospende la pagina e le richieste falliscono
+let wakeLock = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wakeLock && navigator.wakeLock && document.visibilityState === 'visible') {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } else if (!on && wakeLock) {
+      await wakeLock.release();
+      wakeLock = null;
+    }
+  } catch { wakeLock = null; }
+}
+// Tornando sull'app (schermo riacceso) riprende subito il lavoro rimasto
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') { clearTimeout(matchRetry); matchPending(); }
+});
 
 // Ogni tratto in auto ha una "firma" (inizio, fine, numero di punti): se un file viene riscaricato
 // (es. quello di oggi, che GPSLogger aggiorna ogni ora) i tratti già agganciati si riusano
@@ -500,6 +520,7 @@ async function matchPending() {
             const old = known.get(k);
             if (old) { runs.push({ i0, i1, k, coords: old.coords, why: null, dist: old.dist }); continue; }
             worked = true;
+            keepAwake(true);
             setStatus(`Aggancio alle strade i percorsi in auto del ${dayLabel(rec.name)}…` + (todo.length > 1 ? ` (${done}/${todo.length})` : ''));
             const { coords, why } = await (tl ? routeRun(part) : matchRun(part));
             runs.push({ i0, i1, k, coords, why, dist: coords ? pathLength(coords) : null });
@@ -524,8 +545,12 @@ async function matchPending() {
       try { await uploadCache(); } catch { /* riprova alla prossima sincronizzazione */ }
     }
   } catch (err) {
-    setStatus('Aggancio alle strade non riuscito ora, riproverò più tardi.', true);
+    // server occupato o pagina sospesa: si riprova da soli tra poco (e subito al ritorno sull'app)
+    setStatus('Server delle strade non raggiungibile: riprovo tra un minuto. Quello già fatto è salvato.', true, true);
+    clearTimeout(matchRetry);
+    matchRetry = setTimeout(matchPending, 60_000);
   } finally {
+    keepAwake(false);
     matching = false;
     renderDiag(currentSegments());
   }
