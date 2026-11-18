@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '21';
+const APP_VERSION = '22';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -575,7 +575,7 @@ function splitByMode(pts, modes, runs, day) {
 }
 
 // Filtro della mappa: a piedi / in veicolo (all'apertura sempre entrambi)
-const show = { w: true, v: true, t: true };
+const show = { w: false, v: true, t: true }; // all'apertura: solo veicoli
 const visiblePieces = (segs) => segs.flatMap((s) => s.timeline && !show.t ? [] : s.pieces.filter((p) => show[p.m]));
 
 // Cronologia Google: solo i viaggi in auto, uno per "segmento", raggruppati per giorno
@@ -970,8 +970,8 @@ function refreshYears() {
   const prev = store.get('year', '');
   const years = [...new Set(allSegments.map((s) => s.year))].sort().reverse();
   sel.innerHTML = '';
+  sel.add(new Option('Sempre (tutti gli anni)', 'all'));
   for (const y of years) sel.add(new Option(y === 'senz' ? 'Senza data' : y, y));
-  sel.add(new Option('Tutti gli anni', 'all'));
   const thisYear = String(new Date().getFullYear());
   sel.value = [prev, thisYear, years[0], 'all'].find((v) => v && [...sel.options].some((o) => o.value === v));
 }
@@ -1063,10 +1063,22 @@ async function importTimeline(f) {
   try {
     const { days, trips } = parseTimeline(await f.text());
     if (!trips) throw new Error('nessun viaggio in auto trovato');
-    await removeTimeline();
+    // Si possono caricare più file (es. il backup del vecchio telefono): i viaggi si sommano,
+    // quelli già presenti (stessa ora di partenza) non vengono duplicati
     const ver = 'tl-' + f.size + '-' + f.lastModified;
     for (const [day, segments] of days) {
-      await DB.put({ name: TL_PREFIX + day, source: 'timeline', ver, modifiedTime: ver, pv: PARSE_VERSION, segments });
+      const name = TL_PREFIX + day;
+      const old = await DB.get(name);
+      if (old && old.source === 'timeline') {
+        const starts = new Set(old.segments.map((t) => t[0][2]));
+        const added = segments.filter((t) => !starts.has(t[0][2]));
+        if (!added.length) continue;
+        const merged = [...old.segments, ...added].sort((a, b) => a[0][2] - b[0][2]);
+        const oldRuns = [...(old.match?.segs || []).flat(), ...(old.oldRuns || [])].filter((r) => r && r.k && r.coords);
+        await DB.put({ name, source: 'timeline', ver: old.ver + '+' + ver, modifiedTime: ver, pv: PARSE_VERSION, segments: merged, oldRuns });
+      } else {
+        await DB.put({ name, source: 'timeline', ver, modifiedTime: ver, pv: PARSE_VERSION, segments });
+      }
     }
     await reloadFromDb(true);
     setStatus(`Cronologia Google: ${trips} viaggi in auto in ${days.size} giorni. Ricostruisco i percorsi sulle strade…`, false, true);
