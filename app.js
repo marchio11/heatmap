@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '20';
+const APP_VERSION = '21';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -103,6 +103,10 @@ const DB = {
   async put(rec) {
     this._mem.set(rec.name, rec);
     await this._tx('readwrite', (s) => s && s.put(rec));
+  },
+  async del(name) {
+    this._mem.delete(name);
+    await this._tx('readwrite', (s) => s && s.delete(name));
   },
   async clear() {
     this._mem.clear();
@@ -369,7 +373,7 @@ async function matchChunk(chunk) {
   return b.coords ? b : { why: `${r.why}, piano B: ${b.why}` };
 }
 
-async function osrmRoute(pts) {
+async function osrmRoute(pts, maxRatio = 1.6) {
   const params = new URLSearchParams({ overview: 'full', geometries: 'geojson', continue_straight: 'false' });
   const url = OSRM_ROUTE_URL + pts.map((p) => `${p[1].toFixed(6)},${p[0].toFixed(6)}`).join(';') + '?' + params;
   const res = await fetch(url);
@@ -378,7 +382,7 @@ async function osrmRoute(pts) {
   if (json && json.code === 'Ok' && json.routes?.length) {
     const route = json.routes[0];
     // passando per punti imprecisi il percorso può fare giri strani: in quel caso meglio la traccia GPS
-    if (route.distance > 1.6 * pathLength(pts) + 300) return { why: 'percorso poco credibile' };
+    if (route.distance > maxRatio * pathLength(pts) + 300) return { why: 'percorso poco credibile' };
     return { coords: route.geometry.coordinates.map(([lon, lat]) => [lat, lon]) };
   }
   if (json && json.code) return { why: json.code };
@@ -430,6 +434,24 @@ async function matchRun(pts) {
   return { coords: matchedAny ? out : null, why };
 }
 
+// Viaggi della Cronologia Google: un punto ogni 1-5 minuti, troppo pochi per l'aggancio.
+// Si chiede il percorso stradale che passa per tutti i punti (con più tolleranza sulle curve).
+async function routeRun(pts) {
+  const out = [];
+  let routedAny = false, why = null;
+  for (let s = 0; s < pts.length - 1; s += 49) {
+    const chunk = pts.slice(s, s + 50);
+    let r;
+    try { r = await osrmRoute(chunk, 2.2); } catch (e) { throw e; }
+    await sleep(1100);
+    const piece = r.coords || chunk.map((p) => [p[0], p[1]]);
+    if (r.coords) routedAny = true;
+    else why = r.why;
+    out.push(...(out.length ? piece.slice(1) : piece));
+  }
+  return { coords: routedAny ? out : null, why };
+}
+
 // L'aggancio vale solo se fatto con la stessa versione e sulla stessa lettura del file GPX
 function matchValid(rec) {
   const m = rec.match;
@@ -461,23 +483,25 @@ async function matchPending() {
   try {
     for (;;) {
       const all = await DB.all();
-      const todo = all.filter((r) => !matchValid(r));
+      const covered = hiddenTimeline(all);
+      const todo = all.filter((r) => !matchValid(r) && !covered(r));
       if (!todo.length) break;
       const known = knownRuns(all);
       let done = 0;
       for (const rec of todo) {
         done++;
         const segs = [];
+        const tl = rec.source === 'timeline';
         for (const pts of rec.segments) {
           const runs = [];
-          for (const [i0, i1] of vehicleRuns(classify(pts).modes)) {
+          for (const [i0, i1] of tl ? [[0, pts.length - 1]] : vehicleRuns(classify(pts).modes)) {
             const part = pts.slice(i0, i1 + 1);
-            const k = runKey(part);
+            const k = (tl ? 'R' : '') + runKey(part);
             const old = known.get(k);
             if (old) { runs.push({ i0, i1, k, coords: old.coords, why: null, dist: old.dist }); continue; }
             worked = true;
             setStatus(`Aggancio alle strade i percorsi in auto del ${dayLabel(rec.name)}…` + (todo.length > 1 ? ` (${done}/${todo.length})` : ''));
-            const { coords, why } = await matchRun(part);
+            const { coords, why } = await (tl ? routeRun(part) : matchRun(part));
             runs.push({ i0, i1, k, coords, why, dist: coords ? pathLength(coords) : null });
           }
           segs.push(runs);
@@ -551,12 +575,88 @@ function splitByMode(pts, modes, runs, day) {
 }
 
 // Filtro della mappa: a piedi / in veicolo (all'apertura sempre entrambi)
-const show = { w: true, v: true };
-const visiblePieces = (segs) => segs.flatMap((s) => s.pieces.filter((p) => show[p.m]));
+const show = { w: true, v: true, t: true };
+const visiblePieces = (segs) => segs.flatMap((s) => s.timeline && !show.t ? [] : s.pieces.filter((p) => show[p.m]));
+
+// Cronologia Google: solo i viaggi in auto, uno per "segmento", raggruppati per giorno
+const TL_PREFIX = 'cronologia-';
+const TL_VEHICLES = new Set(['IN_PASSENGER_VEHICLE', 'IN_VEHICLE', 'IN_CAR', 'DRIVING', 'MOTORCYCLING', 'IN_TAXI']);
+
+function parseTimeline(text) {
+  const json = JSON.parse(text);
+  const segsIn = Array.isArray(json) ? json : json.semanticSegments;
+  if (!Array.isArray(segsIn)) throw new Error('Non è un file della Cronologia di Google Maps');
+  const ll = (str) => {
+    const m = /(-?[\d.]+)°?\s*,\s*(-?[\d.]+)/.exec(str || '');
+    return m ? [parseFloat(m[1]), parseFloat(m[2])] : null;
+  };
+  const path = [];
+  for (const sg of segsIn) {
+    for (const q of sg.timelinePath || []) {
+      const p = ll(q.point), t = Date.parse(q.time);
+      if (p && isFinite(t)) path.push([p[0], p[1], t]);
+    }
+  }
+  path.sort((a, b) => a[2] - b[2]);
+  const times = path.map((p) => p[2]);
+  const lower = (t) => { let lo = 0, hi = times.length; while (lo < hi) { const m = (lo + hi) >> 1; if (times[m] < t) lo = m + 1; else hi = m; } return lo; };
+  const days = new Map();
+  let trips = 0;
+  for (const sg of segsIn) {
+    const a = sg.activity;
+    if (!a || !TL_VEHICLES.has(a.topCandidate?.type)) continue;
+    const t0 = Date.parse(sg.startTime), t1 = Date.parse(sg.endTime);
+    if (!isFinite(t0) || !isFinite(t1)) continue;
+    const pts = [];
+    const start = ll(a.start?.latLng), end = ll(a.end?.latLng);
+    if (start) pts.push([start[0], start[1], t0]);
+    for (let i = lower(t0 - 60000); i < path.length && path[i][2] <= t1 + 60000; i++) pts.push(path[i]);
+    if (end) pts.push([end[0], end[1], t1]);
+    pts.sort((x, y) => x[2] - y[2]);
+    const clean = [];
+    for (const p of pts) {
+      const prev = clean[clean.length - 1];
+      if (prev && ((prev[0] === p[0] && prev[1] === p[1]) || p[2] - prev[2] < 1000)) continue; // doppioni nello stesso istante
+      clean.push([Math.round(p[0] * 1e6) / 1e6, Math.round(p[1] * 1e6) / 1e6, p[2], null, 'vehicle', null]);
+    }
+    // Punti impossibili: oltre 180 km/h sia per arrivarci sia per ripartire (salti della Cronologia)
+    for (let changed = true; changed;) {
+      changed = false;
+      for (let i = 1; i < clean.length - 1; i++) {
+        const a = clean[i - 1], q = clean[i], b = clean[i + 1];
+        const v = (x, y) => haversine(x, y) / Math.max(1, (y[2] - x[2]) / 1000) * 3.6;
+        if (v(a, q) > 180 && v(q, b) > 180 && v(a, b) < 180) { clean.splice(i, 1); changed = true; break; }
+      }
+    }
+    if (clean.length < 2 || pathLength(clean) < 300) continue;
+    const day = sg.startTime.slice(0, 10).replace(/-/g, '');
+    if (!days.has(day)) days.set(day, []);
+    days.get(day).push(clean);
+    trips++;
+  }
+  return { days, trips };
+}
+
+// Nei giorni registrati con GPSLogger la Cronologia non serve (e sarebbe un doppione)
+function hiddenTimeline(records) {
+  const gpxDays = new Set();
+  for (const rec of records) {
+    if (rec.source === 'timeline') continue;
+    for (const pts of rec.segments) {
+      if (pts[0][2] === null) continue;
+      const d = new Date(pts[0][2]);
+      gpxDays.add(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`);
+    }
+  }
+  return (rec) => rec.source === 'timeline' && gpxDays.has(rec.name.slice(TL_PREFIX.length));
+}
 
 function buildIndex(records) {
   const segs = [];
+  const covered = hiddenTimeline(records);
   for (const rec of records) {
+    const timeline = rec.source === 'timeline';
+    if (covered(rec)) continue;
     const fromName = /(\d{4})(\d{2})(\d{2})/.exec(rec.name);
     const matched = snapEnabled() && matchValid(rec) ? rec.match.segs : null;
     rec.segments.forEach((pts, k) => {
@@ -592,6 +692,8 @@ function buildIndex(records) {
       }
       segs.push({
         path,
+        timeline,
+        raw: timeline ? pts : null,
         pieces: splitByMode(pts, modes, runs, day),
         runs: runs || [],
         day,
@@ -753,7 +855,7 @@ async function fillElevations() {
   try {
     const missing = new Map();
     for (const seg of allSegments) {
-      for (const p of seg.path) {
+      for (const p of seg.raw || seg.path) { // Cronologia: solo i punti veri, non i percorsi ricostruiti
         const k = cellKey(p);
         if (!(k in elevCache) && !missing.has(k)) missing.set(k, p);
       }
@@ -878,12 +980,19 @@ function render(fit) {
   const segs = currentSegments();
   heat.setSegments(visiblePieces(segs));
 
-  let walk = 0, vehicle = 0;
+  let walk = 0, vehicle = 0, tl = 0;
   const days = new Set();
-  for (const s of segs) { walk += s.km.walk; vehicle += s.km.vehicle; days.add(s.day); }
+  for (const s of segs) {
+    if (s.timeline) { tl += s.km.vehicle; if (show.t) days.add(s.day); continue; }
+    walk += s.km.walk; vehicle += s.km.vehicle; days.add(s.day);
+  }
+  const hasTl = allSegments.some((s) => s.timeline);
+  $('rowTimeline').hidden = !hasTl;
+  $('clearTimeline').hidden = !hasTl;
   $('kmWalk').textContent = segs.length ? fmtKm(walk) : '–';
   $('kmVehicle').textContent = segs.length ? fmtKm(vehicle) : '–';
-  $('days').textContent = segs.length ? days.size : '–';
+  $('kmTimeline').textContent = fmtKm(tl);
+  $('days').textContent = days.size || '–';
   renderRecords();
   renderDiag(segs);
 
@@ -923,7 +1032,7 @@ async function reloadFromDb(fit) {
 
 $('ver').textContent = APP_VERSION;
 
-for (const [id, m] of [['showWalk', 'w'], ['showVehicle', 'v']]) {
+for (const [id, m] of [['showWalk', 'w'], ['showVehicle', 'v'], ['showTimeline', 't']]) {
   $(id).addEventListener('change', (e) => { show[m] = e.target.checked; render(false); });
 }
 
@@ -950,9 +1059,37 @@ $('clear').addEventListener('click', async () => {
 
 /* ---------------- Caricamento manuale ---------------- */
 
+async function importTimeline(f) {
+  try {
+    const { days, trips } = parseTimeline(await f.text());
+    if (!trips) throw new Error('nessun viaggio in auto trovato');
+    await removeTimeline();
+    const ver = 'tl-' + f.size + '-' + f.lastModified;
+    for (const [day, segments] of days) {
+      await DB.put({ name: TL_PREFIX + day, source: 'timeline', ver, modifiedTime: ver, pv: PARSE_VERSION, segments });
+    }
+    await reloadFromDb(true);
+    setStatus(`Cronologia Google: ${trips} viaggi in auto in ${days.size} giorni. Ricostruisco i percorsi sulle strade…`, false, true);
+  } catch (err) {
+    setStatus('Cronologia Google non leggibile: ' + err.message, true);
+  }
+}
+
+async function removeTimeline() {
+  for (const r of await DB.all()) if (r.source === 'timeline') await DB.del(r.name);
+}
+
+$('clearTimeline').addEventListener('click', async () => {
+  if (!confirm('Togliere dalla mappa tutti i viaggi della Cronologia Google? I file GPX non vengono toccati.')) return;
+  await removeTimeline();
+  await reloadFromDb(false);
+  setStatus('Cronologia Google rimossa.');
+});
+
 async function importFiles(files) {
   let ok = 0, bad = 0;
   for (const f of files) {
+    if (/\.json$/i.test(f.name)) { await importTimeline(f); continue; }
     if (!/\.gpx$/i.test(f.name)) continue;
     try {
       const segments = parseGpx(await f.text());
@@ -960,8 +1097,10 @@ async function importFiles(files) {
       ok++;
     } catch { bad++; }
   }
-  await reloadFromDb(true);
-  setStatus(`Caricati ${ok} file` + (bad ? `, ${bad} non leggibili` : '') + '.', bad > 0 && ok === 0);
+  if (ok || bad) {
+    await reloadFromDb(true);
+    setStatus(`Caricati ${ok} file` + (bad ? `, ${bad} non leggibili` : '') + '.', bad > 0 && ok === 0);
+  }
 }
 
 $('fileInput').addEventListener('change', (e) => { importFiles([...e.target.files]); e.target.value = ''; });

@@ -147,3 +147,5 @@ body.dragging #drop { display: flex; }
 @media (max-width: 600px) {
   #panel { left: 8px; right: 8px; width: auto; max-width: none; top: max(8px, env(safe-area-inset-top)); }
 }
+
+[hidden] { display: none !important; }
