@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '31';
+const APP_VERSION = '32';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -437,6 +437,14 @@ async function matchRun(pts) {
 // Viaggi della Cronologia Google: un punto ogni 1-5 minuti, troppo pochi per l'aggancio.
 // Si chiede il percorso stradale che passa per tutti i punti (con più tolleranza sulle curve).
 async function routeRun(pts) {
+  // Oltre 90 km/h si è in autostrada o superstrada: i punti intermedi (spesso un po' spostati)
+  // verrebbero agganciati alla statale accanto (es. SS16 lungo l'A14). Si tolgono e il server
+  // sceglie da solo la strada veloce tra punti più distanti.
+  const v = (x, y) => haversine(x, y) / Math.max(1, (y[2] - x[2]) / 1000) * 3.6;
+  pts = pts.slice();
+  for (let i = 1; i < pts.length - 1; i++) {
+    if (v(pts[i - 1], pts[i]) > 90 && v(pts[i], pts[i + 1]) > 90 && haversine(pts[i - 1], pts[i + 1]) < 20000) { pts.splice(i, 1); i--; }
+  }
   const out = [];
   let routedAny = false, why = null;
   for (let s = 0; s < pts.length - 1; s += 49) {
@@ -521,7 +529,7 @@ async function matchPending() {
           const runs = [];
           for (const [i0, i1] of tl ? [[0, pts.length - 1]] : vehicleRuns(classify(pts).modes)) {
             const part = pts.slice(i0, i1 + 1);
-            const k = (tl ? 'R' : '') + runKey(part);
+            const k = (tl ? 'R2' : '') + runKey(part); // R2: con i punti d'autostrada sfoltiti
             const old = known.get(k);
             if (old) { runs.push({ i0, i1, k, coords: old.coords, why: null, dist: old.dist }); continue; }
             worked = true;
@@ -578,7 +586,8 @@ function bboxOf(path) {
 
 // Divide una traccia in pezzi "a piedi" e "in veicolo" (per il filtro della mappa).
 // Nei pezzi in veicolo i tratti agganciati alle strade sostituiscono i punti GPS.
-function splitByMode(pts, modes, runs, day) {
+function splitByMode(pts, modes, runs, day, timeline = false) {
+  const raw = timeline ? new Set(pts.map((q) => q[0] + ',' + q[1])) : null;
   const pieces = [];
   let s = 0;
   for (let i = 1; i <= modes.length; i++) {
@@ -598,7 +607,20 @@ function splitByMode(pts, modes, runs, day) {
     } else {
       path = pts.slice(s, e + 1);
     }
-    if (path.length >= 2) pieces.push({ m, path, day, bbox: bboxOf(path) });
+    // Cronologia: dove la ricostruzione sulle strade non è riuscita, due punti veri lontani
+    // non si uniscono con una riga dritta (es. 18/10/2025: 8 km in linea d'aria sui monti)
+    const parts = [path];
+    if (raw) {
+      parts.length = 0;
+      let cur = [];
+      for (const q of path) {
+        const prev = cur[cur.length - 1];
+        if (prev && raw.has(prev[0] + ',' + prev[1]) && raw.has(q[0] + ',' + q[1]) && haversine(prev, q) > 1000) { parts.push(cur); cur = []; }
+        cur.push(q);
+      }
+      parts.push(cur);
+    }
+    for (const pp of parts) if (pp.length >= 2) pieces.push({ m, path: pp, day, bbox: bboxOf(pp) });
     s = i;
   }
   return pieces;
@@ -614,7 +636,7 @@ const TL_VEHICLES = new Set(['IN_PASSENGER_VEHICLE', 'IN_VEHICLE', 'IN_CAR', 'DR
 
 // Pulizia di un viaggio della Cronologia (modifica l'array). Se cambia, alzare TL_CLEAN:
 // i viaggi già caricati vengono ripuliti da soli all'apertura.
-const TL_CLEAN = 3;
+const TL_CLEAN = 4;
 function cleanTrip(clean) {
   const v = (x, y) => haversine(x, y) / Math.max(1, (y[2] - x[2]) / 1000) * 3.6;
   for (let changed = true; changed;) {
@@ -636,6 +658,16 @@ function cleanTrip(clean) {
   while (clean.length > 2 && v(clean[clean.length - 2], clean[clean.length - 1]) > 180) clean.pop();
   while (clean.length > 2 && v(clean[0], clean[1]) > 180) clean.shift();
   return clean;
+}
+
+// "Viaggio in auto" che per tutto il tempo va a passo d'uomo: è una camminata etichettata male
+// (es. 18/10/2025, escursione al Falterona: 10 km in un'ora, velocità tipica 4 km/h)
+function isSlowTrip(t) {
+  if (t.length < 3 || pathLength(t) < 1000) return false;
+  const sp = [];
+  for (let i = 1; i < t.length; i++) sp.push(haversine(t[i - 1], t[i]) / Math.max(1, (t[i][2] - t[i - 1][2]) / 1000) * 3.6);
+  sp.sort((a, b) => a - b);
+  return sp[Math.floor(sp.length * 0.8)] < 15;
 }
 
 // Un "viaggio" con dentro una sosta lunga (es. notte in camper al passo) si divide in due;
@@ -668,7 +700,7 @@ function splitTrip(trip) {
 async function upgradeTimeline() {
   for (const rec of await DB.all()) {
     if (rec.source !== 'timeline' || (rec.tlv || 1) >= TL_CLEAN) continue;
-    const segments = rec.segments.flatMap((t) => { const c = cleanTrip(t.slice()); return c.length >= 2 ? splitTrip(c) : []; });
+    const segments = rec.segments.flatMap((t) => { const c = cleanTrip(t.slice()); return c.length >= 2 ? splitTrip(c).filter((x) => !isSlowTrip(x)) : []; });
     const oldRuns = [...(rec.match?.segs || []).flat(), ...(rec.oldRuns || [])].filter((r) => r && r.k && r.coords);
     if (!segments.length) { await DB.del(rec.name); continue; }
     await DB.put({ name: rec.name, source: 'timeline', ver: rec.ver + '+c' + TL_CLEAN, modifiedTime: rec.modifiedTime, pv: rec.pv, tlv: TL_CLEAN, segments, oldRuns });
@@ -716,6 +748,7 @@ function parseTimeline(text) {
     if (clean.length < 2) continue;
     const day = sg.startTime.slice(0, 10).replace(/-/g, '');
     for (const part of splitTrip(clean)) {
+      if (isSlowTrip(part)) continue;
       if (!days.has(day)) days.set(day, []);
       days.get(day).push(part);
       trips++;
@@ -882,7 +915,7 @@ function buildIndex(records) {
         timeline,
         raw: timeline ? pts : null,
         // Cronologia: le quote sono chieste per i punti veri, non per i percorsi ricostruiti
-        pieces: splitByMode(pts, modes, runs, day).map((pc) => timeline ? { ...pc, elev: roadPoints(pts, runs) } : pc),
+        pieces: splitByMode(pts, modes, runs, day, timeline).map((pc) => timeline ? { ...pc, elev: roadPoints(pts, runs) } : pc),
         runs: runs || [],
         day,
         year: day.slice(0, 4),
