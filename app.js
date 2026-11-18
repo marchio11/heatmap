@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '26';
+const APP_VERSION = '27';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -612,6 +612,40 @@ const visiblePieces = (segs) => segs.flatMap((s) => s.timeline && !show.t ? [] :
 const TL_PREFIX = 'cronologia-';
 const TL_VEHICLES = new Set(['IN_PASSENGER_VEHICLE', 'IN_VEHICLE', 'IN_CAR', 'DRIVING', 'MOTORCYCLING', 'IN_TAXI']);
 
+// Pulizia di un viaggio della Cronologia (modifica l'array). Se cambia, alzare TL_CLEAN:
+// i viaggi già caricati vengono ripuliti da soli all'apertura.
+const TL_CLEAN = 2;
+function cleanTrip(clean) {
+  const v = (x, y) => haversine(x, y) / Math.max(1, (y[2] - x[2]) / 1000) * 3.6;
+  for (let changed = true; changed;) {
+    changed = false;
+    for (let i = 1; i < clean.length - 1 && !changed; i++) {
+      // 1) punto impossibile: oltre 180 km/h sia per arrivarci sia per ripartire
+      const a = clean[i - 1], q = clean[i], b = clean[i + 1];
+      if (v(a, q) > 180 && v(q, b) > 180 && v(a, b) < 180) { clean.splice(i, 1); changed = true; break; }
+      // 2) "andata e ritorno" impossibile: 1-2 punti lontani e poi di nuovo quasi al punto di prima
+      //    (es. 11/7 al Passo di Pennes: punti sparsi verso Vipiteno e in fondo alla valle)
+      for (let k = 1; k <= 2 && i + k < clean.length; k++) {
+        const seq = clean.slice(i - 1, i + k + 1);
+        const via = pathLength(seq), direct = haversine(seq[0], seq[seq.length - 1]);
+        if (via > 3 * direct + 3000) { clean.splice(i, k); changed = true; break; }
+      }
+    }
+  }
+  return clean;
+}
+
+// Ripulisce i viaggi caricati con una versione precedente della pulizia
+async function upgradeTimeline() {
+  for (const rec of await DB.all()) {
+    if (rec.source !== 'timeline' || (rec.tlv || 1) >= TL_CLEAN) continue;
+    const segments = rec.segments.map((t) => cleanTrip(t.slice())).filter((t) => t.length >= 2 && pathLength(t) >= 300);
+    const oldRuns = [...(rec.match?.segs || []).flat(), ...(rec.oldRuns || [])].filter((r) => r && r.k && r.coords);
+    if (!segments.length) { await DB.del(rec.name); continue; }
+    await DB.put({ name: rec.name, source: 'timeline', ver: rec.ver + '+c' + TL_CLEAN, modifiedTime: rec.modifiedTime, pv: rec.pv, tlv: TL_CLEAN, segments, oldRuns });
+  }
+}
+
 function parseTimeline(text) {
   const json = JSON.parse(text);
   const segsIn = Array.isArray(json) ? json : json.semanticSegments;
@@ -649,15 +683,7 @@ function parseTimeline(text) {
       if (prev && ((prev[0] === p[0] && prev[1] === p[1]) || p[2] - prev[2] < 1000)) continue; // doppioni nello stesso istante
       clean.push([Math.round(p[0] * 1e6) / 1e6, Math.round(p[1] * 1e6) / 1e6, p[2], null, 'vehicle', null]);
     }
-    // Punti impossibili: oltre 180 km/h sia per arrivarci sia per ripartire (salti della Cronologia)
-    for (let changed = true; changed;) {
-      changed = false;
-      for (let i = 1; i < clean.length - 1; i++) {
-        const a = clean[i - 1], q = clean[i], b = clean[i + 1];
-        const v = (x, y) => haversine(x, y) / Math.max(1, (y[2] - x[2]) / 1000) * 3.6;
-        if (v(a, q) > 180 && v(q, b) > 180 && v(a, b) < 180) { clean.splice(i, 1); changed = true; break; }
-      }
-    }
+    cleanTrip(clean);
     if (clean.length < 2 || pathLength(clean) < 300) continue;
     const day = sg.startTime.slice(0, 10).replace(/-/g, '');
     if (!days.has(day)) days.set(day, []);
@@ -1101,6 +1127,7 @@ function renderDiag(segs) {
 }
 
 async function reloadFromDb(fit) {
+  await upgradeTimeline();
   buildIndex(await DB.all());
   refreshYears();
   render(fit);
@@ -1153,9 +1180,9 @@ async function importTimeline(f) {
         if (!added.length) continue;
         const merged = [...old.segments, ...added].sort((a, b) => a[0][2] - b[0][2]);
         const oldRuns = [...(old.match?.segs || []).flat(), ...(old.oldRuns || [])].filter((r) => r && r.k && r.coords);
-        await DB.put({ name, source: 'timeline', ver: old.ver + '+' + ver, modifiedTime: ver, pv: PARSE_VERSION, segments: merged, oldRuns });
+        await DB.put({ name, source: 'timeline', ver: old.ver + '+' + ver, modifiedTime: ver, pv: PARSE_VERSION, tlv: TL_CLEAN, segments: merged, oldRuns });
       } else {
-        await DB.put({ name, source: 'timeline', ver, modifiedTime: ver, pv: PARSE_VERSION, segments });
+        await DB.put({ name, source: 'timeline', ver, modifiedTime: ver, pv: PARSE_VERSION, tlv: TL_CLEAN, segments });
       }
     }
     await reloadFromDb(true);
