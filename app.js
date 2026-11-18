@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '30';
+const APP_VERSION = '31';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -772,6 +772,18 @@ function parseTimeline(text) {
       trips++;
     }
   }
+  // Raccordi: l'auto non si teletrasporta. Se un viaggio finisce e il successivo riparte poco
+  // lontano (es. 13-14/6: parcheggio del Giau → Rifugio Piezza), in mezzo ci è passata per forza.
+  const all = [...days.entries()].flatMap(([day, ts]) => ts.map((t) => ({ day, t }))).sort((a, b) => a.t[0][2] - b.t[0][2]);
+  for (let i = 1; i < all.length; i++) {
+    const a = all[i - 1].t, b = all[i].t;
+    const end = a[a.length - 1], start = b[0];
+    const gap = haversine(end, start), dt = start[2] - end[2];
+    if (gap < 300 || gap > 2000 || dt <= 0 || dt > 36 * 3600 * 1000) continue;
+    const link = [[end[0], end[1], end[2] + 1000, null, 'vehicle', null], [start[0], start[1], start[2] - 1000, null, 'vehicle', null]];
+    days.get(all[i].day).push(link);
+    trips++;
+  }
   return { days, trips };
 }
 
@@ -842,6 +854,8 @@ function buildIndex(records) {
       } else {
         day = 'senza data';
       }
+      // raccordo della Cronologia non ricostruibile sulle strade: meglio niente che una linea dritta
+      if (timeline && pts.length === 2 && !(matched && matched[k] && matched[k][0] && matched[k][0].coords)) return;
       const { km, modes } = classify(pts);
       let path = pts;
       let runs = matched && matched[k];
