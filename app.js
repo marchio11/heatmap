@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '25';
+const APP_VERSION = '26';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -681,6 +681,41 @@ function hiddenTimeline(records) {
   return (rec) => rec.source === 'timeline' && gpxDays.has(rec.name.slice(TL_PREFIX.length));
 }
 
+// Cronologia: per il punto più alto valgono solo i punti vicini alla strada ricostruita.
+// Google a volte mette un punto "in auto" in mezzo ai monti (es. 11/7, verso la Cima di Stilves).
+const ROAD_MAX_M = 150;
+const roadCache = new Map();
+function roadPoints(pts, runs) {
+  const run = runs && runs[0];
+  if (!run || !run.coords) return []; // percorso non ricostruito: quote non affidabili
+  const key = run.k || null;
+  if (key && roadCache.has(key)) return roadCache.get(key);
+  // griglia di celle da circa 200 m con i pezzi di strada che le toccano
+  const cell = (p) => Math.floor(p[0] * 500) + ':' + Math.floor(p[1] * 500);
+  const grid = new Map();
+  const c = run.coords;
+  for (let i = 1; i < c.length; i++) {
+    const a = c[i - 1], b = c[i];
+    const n = Math.max(1, Math.ceil(haversine(a, b) / 150));
+    for (let j = 0; j <= n; j++) {
+      const q = [a[0] + (b[0] - a[0]) * j / n, a[1] + (b[1] - a[1]) * j / n];
+      const k = cell(q);
+      if (!grid.has(k)) grid.set(k, []);
+      grid.get(k).push(q);
+    }
+  }
+  const near = (p) => {
+    const r = Math.floor(p[0] * 500), l = Math.floor(p[1] * 500);
+    for (let dr = -1; dr <= 1; dr++) for (let dl = -1; dl <= 1; dl++) {
+      for (const q of grid.get((r + dr) + ':' + (l + dl)) || []) if (haversine(p, q) <= ROAD_MAX_M) return true;
+    }
+    return false;
+  };
+  const out = pts.filter(near);
+  if (key) roadCache.set(key, out);
+  return out;
+}
+
 function buildIndex(records) {
   const segs = [];
   const covered = hiddenTimeline(records);
@@ -725,7 +760,7 @@ function buildIndex(records) {
         timeline,
         raw: timeline ? pts : null,
         // Cronologia: le quote sono chieste per i punti veri, non per i percorsi ricostruiti
-        pieces: splitByMode(pts, modes, runs, day).map((pc) => timeline ? { ...pc, elev: pts } : pc),
+        pieces: splitByMode(pts, modes, runs, day).map((pc) => timeline ? { ...pc, elev: roadPoints(pts, runs) } : pc),
         runs: runs || [],
         day,
         year: day.slice(0, 4),
