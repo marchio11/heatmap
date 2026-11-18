@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '23';
+const APP_VERSION = '24';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -465,12 +465,14 @@ let matchRetry = null;
 // Durante un aggancio lungo (es. Cronologia Google) tiene lo schermo acceso:
 // a schermo spento il telefono sospende la pagina e le richieste falliscono
 let wakeLock = null;
-async function keepAwake(on) {
+const awake = new Set(); // chi sta lavorando: 'match', 'elev'
+async function keepAwake(on, who = 'match') {
+  if (on) awake.add(who); else awake.delete(who);
   try {
-    if (on && !wakeLock && navigator.wakeLock && document.visibilityState === 'visible') {
+    if (awake.size && !wakeLock && navigator.wakeLock && document.visibilityState === 'visible') {
       wakeLock = await navigator.wakeLock.request('screen');
       wakeLock.addEventListener('release', () => { wakeLock = null; });
-    } else if (!on && wakeLock) {
+    } else if (!awake.size && wakeLock) {
       await wakeLock.release();
       wakeLock = null;
     }
@@ -478,7 +480,10 @@ async function keepAwake(on) {
 }
 // Tornando sull'app (schermo riacceso) riprende subito il lavoro rimasto
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') { clearTimeout(matchRetry); matchPending(); }
+  if (document.visibilityState === 'visible') {
+    clearTimeout(matchRetry); matchPending();
+    clearTimeout(elevRetry); fillElevations();
+  }
 });
 
 // Ogni tratto in auto ha una "firma" (inizio, fine, numero di punti): se un file viene riscaricato
@@ -873,6 +878,7 @@ const cellKey = (p) => Math.round(p[0] * ELEV_CELL) + ',' + Math.round(p[1] * EL
 let elevCache = {};
 try { elevCache = JSON.parse(store.get('elev', '{}')) || {}; } catch { elevCache = {}; }
 let elevBusy = false;
+let elevRetry = null;
 
 async function fillElevations() {
   if (elevBusy) return;
@@ -891,6 +897,7 @@ async function fillElevations() {
       const url = 'https://api.open-meteo.com/v1/elevation?latitude=' +
         batch.map(([, p]) => p[0].toFixed(5)).join(',') + '&longitude=' +
         batch.map(([, p]) => p[1].toFixed(5)).join(',');
+      if (i === 0 && list.length > 300) keepAwake(true, 'elev');
       const res = await fetch(url);
       if (!res.ok) throw new Error('quote non disponibili');
       const json = await res.json();
@@ -900,10 +907,18 @@ async function fillElevations() {
       });
       store.set('elev', JSON.stringify(elevCache));
       if (list.length > 300) setStatus(`Calcolo le quote… ${Math.min(i + 100, list.length)}/${list.length}`);
-      await sleep(250);
+      if ((i / 100) % 10 === 9) renderRecords(); // il record si aggiorna strada facendo
+      // Open-Meteo gratuito: max 600 "chiamate" al minuto, e 100 luoghi contano come 10 chiamate
+      await sleep(1100);
     }
     if (list.length) renderRecords();
-  } catch { /* riprova alla prossima apertura */ } finally {
+    if (list.length > 300) setStatus('Quote calcolate: punto più alto aggiornato.');
+  } catch {
+    // limite del servizio o pagina sospesa: riprovo tra un minuto (quello già fatto è salvato)
+    clearTimeout(elevRetry);
+    elevRetry = setTimeout(fillElevations, 60_000);
+  } finally {
+    keepAwake(false, 'elev');
     elevBusy = false;
   }
 }
