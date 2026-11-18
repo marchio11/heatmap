@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '29';
+const APP_VERSION = '30';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1257,8 +1257,11 @@ async function importTimeline(f) {
       const name = TL_PREFIX + day;
       const old = await DB.get(name);
       if (old && old.source === 'timeline') {
-        const starts = new Set(old.segments.map((t) => t[0][2]));
-        const added = segments.filter((t) => !starts.has(t[0][2]));
+        // doppione solo se coincidono partenza e arrivo (13/6: il tragitto Falzarego-Giau parte alla
+        // stessa ora di un finto "viaggio" di zero minuti e veniva scartato)
+        const tripKey = (t) => t[0][2] + '-' + t[t.length - 1][2];
+        const known = new Set(old.segments.map(tripKey));
+        const added = segments.filter((t) => !known.has(tripKey(t)));
         if (!added.length) continue;
         const merged = [...old.segments, ...added].sort((a, b) => a[0][2] - b[0][2]);
         const oldRuns = [...(old.match?.segs || []).flat(), ...(old.oldRuns || [])].filter((r) => r && r.k && r.coords);
