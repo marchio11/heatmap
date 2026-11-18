@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '32';
+const APP_VERSION = '33';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -636,7 +636,7 @@ const TL_VEHICLES = new Set(['IN_PASSENGER_VEHICLE', 'IN_VEHICLE', 'IN_CAR', 'DR
 
 // Pulizia di un viaggio della Cronologia (modifica l'array). Se cambia, alzare TL_CLEAN:
 // i viaggi già caricati vengono ripuliti da soli all'apertura.
-const TL_CLEAN = 4;
+const TL_CLEAN = 5;
 function cleanTrip(clean) {
   const v = (x, y) => haversine(x, y) / Math.max(1, (y[2] - x[2]) / 1000) * 3.6;
   for (let changed = true; changed;) {
@@ -667,7 +667,9 @@ function isSlowTrip(t) {
   const sp = [];
   for (let i = 1; i < t.length; i++) sp.push(haversine(t[i - 1], t[i]) / Math.max(1, (t[i][2] - t[i - 1][2]) / 1000) * 3.6);
   sp.sort((a, b) => a - b);
-  return sp[Math.floor(sp.length * 0.8)] < 15;
+  // anche la media di tutto il viaggio deve essere da pedone: in coda in città si sta sopra i 10 km/h
+  const avg = pathLength(t) / Math.max(1, (t[t.length - 1][2] - t[0][2]) / 1000) * 3.6;
+  return sp[Math.floor(sp.length * 0.8)] < 15 && avg < 10;
 }
 
 // Un "viaggio" con dentro una sosta lunga (es. notte in camper al passo) si divide in due;
