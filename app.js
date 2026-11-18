@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '33';
+const APP_VERSION = '34';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -636,7 +636,7 @@ const TL_VEHICLES = new Set(['IN_PASSENGER_VEHICLE', 'IN_VEHICLE', 'IN_CAR', 'DR
 
 // Pulizia di un viaggio della Cronologia (modifica l'array). Se cambia, alzare TL_CLEAN:
 // i viaggi già caricati vengono ripuliti da soli all'apertura.
-const TL_CLEAN = 5;
+const TL_CLEAN = 6;
 function cleanTrip(clean) {
   const v = (x, y) => haversine(x, y) / Math.max(1, (y[2] - x[2]) / 1000) * 3.6;
   for (let changed = true; changed;) {
@@ -675,10 +675,29 @@ function isSlowTrip(t) {
 // Un "viaggio" con dentro una sosta lunga (es. notte in camper al passo) si divide in due;
 // i pezzi corti attaccati alla sosta sono quasi sempre a piedi (si parte per un sentiero)
 const STOP_MS = 20 * 60 * 1000, STOP_M = 200, AFTER_STOP_MIN_M = 2000;
+const WALK_IN_TRIP_KMH = 7, WALK_IN_TRIP_MS = 10 * 60 * 1000;
 function splitTrip(trip) {
+  // Tratti a passo d'uomo per almeno 10 minuti dentro un viaggio (es. 23/5 a Castelluccio:
+  // 40 minuti a 2-4 km/h intorno al Colle Moretta): si trattano come una sosta
+  const slowEnd = new Map(); // indice d'inizio → indice di fine del tratto lento
+  for (let i = 0; i < trip.length - 1;) {
+    let j = i;
+    while (j + 1 < trip.length &&
+      haversine(trip[j], trip[j + 1]) / Math.max(1, (trip[j + 1][2] - trip[j][2]) / 1000) * 3.6 < WALK_IN_TRIP_KMH) j++;
+    if (j > i && trip[j][2] - trip[i][2] >= WALK_IN_TRIP_MS) slowEnd.set(i, j);
+    i = Math.max(j, i + 1);
+  }
   const parts = [];
   let cur = [trip[0]];
-  for (let i = 1; i < trip.length; i++) {
+  if (slowEnd.has(0)) { parts.push({ pts: cur, stopAfter: true }); cur = [trip[slowEnd.get(0)]]; }
+  for (let i = slowEnd.has(0) ? slowEnd.get(0) + 1 : 1; i < trip.length; i++) {
+    if (slowEnd.has(i)) {
+      cur.push(trip[i]);
+      parts.push({ pts: cur, stopAfter: true });
+      cur = [trip[slowEnd.get(i)]];
+      i = slowEnd.get(i);
+      continue;
+    }
     // sosta: dal punto i in avanti si resta entro 200 m per almeno 20 minuti
     let j = i;
     while (j + 1 < trip.length && haversine(trip[i], trip[j + 1]) <= STOP_M) j++;
