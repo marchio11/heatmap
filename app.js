@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '36';
+const APP_VERSION = '37';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -436,6 +436,7 @@ async function matchRun(pts) {
 
 // Viaggi della Cronologia Google: un punto ogni 1-5 minuti, troppo pochi per l'aggancio.
 // Si chiede il percorso stradale che passa per tutti i punti (con più tolleranza sulle curve).
+const ROUTE_V = 2; // 2: i blocchi scartati si riprovano tratto per tratto
 async function routeRun(pts) {
   // Oltre 90 km/h si è in autostrada o superstrada: i punti intermedi (spesso un po' spostati)
   // verrebbero agganciati alla statale accanto (es. SS16 lungo l'A14). Si tolgono e il server
@@ -449,15 +450,32 @@ async function routeRun(pts) {
   let routedAny = false, why = null;
   for (let s = 0; s < pts.length - 1; s += 49) {
     const chunk = pts.slice(s, s + 50);
-    let r;
-    try { r = await osrmRoute(chunk, 2.2); } catch (e) { throw e; }
+    const r = await osrmRoute(chunk, 2.2);
     await sleep(1100);
-    const piece = r.coords || chunk.map((p) => [p[0], p[1]]);
-    if (r.coords) routedAny = true;
-    else why = r.why;
+    let piece = r.coords;
+    if (!piece) {
+      // Blocco scartato (es. valichi alpini: coi tornanti la strada è 2-3 volte la linea d'aria):
+      // riprovo tratto per tratto, con più tolleranza ma su distanze brevi (12-13/8/2025)
+      piece = [[chunk[0][0], chunk[0][1]]];
+      let ok = 0;
+      for (let i = 1; i < chunk.length; i++) {
+        const a = chunk[i - 1], b = chunk[i];
+        let leg = null;
+        if (haversine(a, b) > 300) {
+          const rr = await osrmRoute([a, b], 3.5);
+          await sleep(1100);
+          leg = rr.coords;
+        }
+        if (leg) { piece.push(...leg.slice(1)); ok++; } else piece.push([b[0], b[1]]);
+      }
+      if (ok) routedAny = true;
+      why = r.why;
+    } else {
+      routedAny = true;
+    }
     out.push(...(out.length ? piece.slice(1) : piece));
   }
-  return { coords: routedAny ? out : null, why };
+  return { coords: routedAny ? out : null, why, rv: ROUTE_V };
 }
 
 // L'aggancio vale solo se fatto con la stessa versione e sulla stessa lettura del file GPX
@@ -500,11 +518,14 @@ document.addEventListener('visibilitychange', () => {
 const MATCH_ALGO = 1;
 const runKey = (p) => `${MATCH_ALGO}|${p[0][2]}|${p[p.length - 1][2]}|${p.length}|${p[0][0]},${p[0][1]}`;
 
+// percorso della Cronologia ricostruito solo in parte con la versione precedente: si rifà
+const stale = (run) => run.k && run.k[0] === 'R' && (run.why || !run.coords) && (run.rv || 1) < ROUTE_V;
+
 function knownRuns(records) {
   const known = new Map();
   for (const r of records) {
     const runs = [...(r.match?.segs || []).flat(), ...(r.oldRuns || [])];
-    for (const run of runs) if (run && run.k && run.coords) known.set(run.k, run);
+    for (const run of runs) if (run && run.k && run.coords && !stale(run)) known.set(run.k, run);
   }
   return known;
 }
@@ -517,7 +538,7 @@ async function matchPending() {
     for (;;) {
       const all = await DB.all();
       const covered = hiddenTimeline(all);
-      const todo = all.filter((r) => !matchValid(r) && !covered(r));
+      const todo = all.filter((r) => (!matchValid(r) || (r.source === 'timeline' && r.match.segs.flat().some((x) => x && stale(x)))) && !covered(r));
       if (!todo.length) break;
       const known = knownRuns(all);
       let done = 0;
@@ -531,12 +552,12 @@ async function matchPending() {
             const part = pts.slice(i0, i1 + 1);
             const k = (tl ? 'R2' : '') + runKey(part); // R2: con i punti d'autostrada sfoltiti
             const old = known.get(k);
-            if (old) { runs.push({ i0, i1, k, coords: old.coords, why: null, dist: old.dist }); continue; }
+            if (old) { runs.push({ i0, i1, k, coords: old.coords, why: old.why || null, rv: old.rv, dist: old.dist }); continue; }
             worked = true;
             keepAwake(true);
             setStatus(`Aggancio alle strade i percorsi in auto del ${dayLabel(rec.name)}…` + (todo.length > 1 ? ` (${done}/${todo.length})` : ''));
-            const { coords, why } = await (tl ? routeRun(part) : matchRun(part));
-            runs.push({ i0, i1, k, coords, why, dist: coords ? pathLength(coords) : null });
+            const { coords, why, rv } = await (tl ? routeRun(part) : matchRun(part));
+            runs.push({ i0, i1, k, coords, why, rv, dist: coords ? pathLength(coords) : null });
           }
           segs.push(runs);
         }
