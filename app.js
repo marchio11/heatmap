@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '34';
+const APP_VERSION = '35';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -780,7 +780,9 @@ function parseTimeline(text) {
   const spans = [];
   for (const sg of segsIn) {
     const t0 = Date.parse(sg.startTime), t1 = Date.parse(sg.endTime);
-    if (sg.activity && isFinite(t0) && isFinite(t1) && t1 - t0 >= 60000) spans.push([t0 - 60000, t1 + 60000]);
+    // gli spostamenti di tipo "sconosciuto" (frequenti nei backup vecchi) si valutano come gli orfani
+    const known = sg.activity && sg.activity.topCandidate?.type !== 'UNKNOWN_ACTIVITY_TYPE';
+    if (known && isFinite(t0) && isFinite(t1) && t1 - t0 >= 60000) spans.push([t0 - 60000, t1 + 60000]);
   }
   spans.sort((a, b) => a[0] - b[0]);
   const merged = [];
