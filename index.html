@@ -12,7 +12,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-  <link rel="stylesheet" href="style.css?v=35">
+  <link rel="stylesheet" href="style.css?v=36">
 </head>
 <body>
   <div id="map"></div>
@@ -66,7 +66,7 @@
         <button id="clear" class="danger">Cancella i dati salvati nel browser</button>
         <p id="diag" class="hint"></p>
         <p class="hint">Versione app: <span id="ver"></span></p>
-        <p class="hint">I file GPX restano su Drive e nel tuo browser; la Cronologia Google caricata resta solo in questo browser. Se l'aggancio alle strade è attivo, solo coordinate e orari dei tratti in auto vengono inviati al server OSRM, senza nessun dato personale. Per il punto più alto vengono chieste a Open-Meteo le quote dei luoghi visitati, sempre in forma anonima.</p>
+        <p class="hint">I file GPX restano su Drive e nel tuo browser; la Cronologia Google caricata viene salvata, già ricostruita, nella cartella nascosta dell'app su Drive, così la ritrovi su ogni dispositivo. Se l'aggancio alle strade è attivo, solo coordinate e orari dei tratti in auto vengono inviati al server OSRM, senza nessun dato personale. Per il punto più alto vengono chieste a Open-Meteo le quote dei luoghi visitati, sempre in forma anonima.</p>
       </details>
     </div>
   </aside>
@@ -75,6 +75,6 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="app.js?v=35"></script>
+  <script src="app.js?v=36"></script>
 </body>
 </html>

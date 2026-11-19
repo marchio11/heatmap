@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '35';
+const APP_VERSION = '36';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -547,6 +547,7 @@ async function matchPending() {
           delete fresh.oldRuns;
           await DB.put(fresh);
           if (fresh.source === 'drive') store.set('cacheDirty', '1');
+          if (fresh.source === 'timeline') markTimelineDirty();
         }
         buildIndex(await DB.all());
         render(false);
@@ -556,6 +557,10 @@ async function matchPending() {
     if (worked) setStatus('Percorsi in auto agganciati alle strade.');
     if (store.get('cacheDirty', '0') === '1' && canUseAppData()) {
       try { await uploadCache(); } catch { /* riprova alla prossima sincronizzazione */ }
+    }
+    // a ricostruzione finita la Cronologia va su Drive (non a ogni viaggio: il file è grande)
+    if (store.get('tlDirty', '0') === '1' && canUseAppData()) {
+      try { await syncTimeline(true); } catch { /* riprova alla prossima sincronizzazione */ }
     }
   } catch (err) {
     // server occupato o pagina sospesa: si riprova da soli tra poco (e subito al ritorno sull'app)
@@ -721,6 +726,7 @@ function splitTrip(trip) {
 async function upgradeTimeline() {
   for (const rec of await DB.all()) {
     if (rec.source !== 'timeline' || (rec.tlv || 1) >= TL_CLEAN) continue;
+    markTimelineDirty();
     const segments = rec.segments.flatMap((t) => { const c = cleanTrip(t.slice()); return c.length >= 2 ? splitTrip(c).filter((x) => !isSlowTrip(x)) : []; });
     const oldRuns = [...(rec.match?.segs || []).flat(), ...(rec.oldRuns || [])].filter((r) => r && r.k && r.coords);
     if (!segments.length) { await DB.del(rec.name); continue; }
@@ -1323,6 +1329,7 @@ async function importTimeline(f) {
     // Si possono caricare più file (es. il backup del vecchio telefono): i viaggi si sommano,
     // quelli già presenti (stessa ora di partenza) non vengono duplicati
     const ver = 'tl-' + f.size + '-' + f.lastModified;
+    markTimelineDirty();
     for (const [day, segments] of days) {
       const name = TL_PREFIX + day;
       const old = await DB.get(name);
@@ -1349,11 +1356,13 @@ async function importTimeline(f) {
 
 async function removeTimeline() {
   for (const r of await DB.all()) if (r.source === 'timeline') await DB.del(r.name);
+  markTimelineDirty();
 }
 
 $('clearTimeline').addEventListener('click', async () => {
-  if (!confirm('Togliere dalla mappa tutti i viaggi della Cronologia Google? I file GPX non vengono toccati.')) return;
+  if (!confirm('Togliere dalla mappa tutti i viaggi della Cronologia Google, anche dalla copia su Drive (quindi da tutti i dispositivi)? I file GPX non vengono toccati.')) return;
   await removeTimeline();
+  if (canUseAppData()) syncTimeline().catch(() => {});
   await reloadFromDb(false);
   setStatus('Cronologia Google rimossa.');
 });
@@ -1520,6 +1529,77 @@ async function uploadCache() {
   store.set('cacheDirty', '0');
 }
 
+/* ---------- Cronologia Google condivisa tra dispositivi (cartella nascosta su Drive) ---------- */
+
+// Tutta la Cronologia già pulita e ricostruita sulle strade, compressa: sugli altri dispositivi
+// si scarica pronta invece di ricaricare i file e rifare un'ora di ricostruzione.
+const TL_FILE = 'timeline.json.gz';
+const markTimelineDirty = () => store.set('tlDirty', '1');
+
+async function gzip(text) {
+  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Response(stream).blob();
+}
+async function gunzip(buf) {
+  const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).text();
+}
+
+async function findTimelineFile() {
+  const files = await listAll(`name = '${TL_FILE}' and trashed = false`, 'id,name,modifiedTime', 'appDataFolder');
+  return files[0] || null;
+}
+
+async function syncTimeline(fromMatch = false) {
+  if (!canUseAppData() || typeof CompressionStream === 'undefined' || (matching && !fromMatch)) return false;
+  const file = await findTimelineFile();
+  const local = (await DB.all()).filter((r) => r.source === 'timeline');
+  const up = 'https://www.googleapis.com/upload/drive/v3/';
+  const dirty = store.get('tlDirty', '0') === '1' || (!file && local.length && !store.get('tlSync', ''));
+
+  if (dirty) {
+    // le modifiche fatte qui (caricamento, ricostruzione, pulizia, rimozione) vanno su Drive
+    if (!local.length) {
+      if (file) await drive('files/' + file.id, {}, true, { method: 'DELETE' });
+      store.set('tlSync', ''); store.set('tlDirty', '0');
+      return false;
+    }
+    setStatus('Salvo la Cronologia su Drive…');
+    const recs = local.map((r) => ({ name: r.name, ver: r.ver, modifiedTime: r.modifiedTime, pv: r.pv, tlv: r.tlv, segments: r.segments, match: r.match }));
+    const blob = await gzip(JSON.stringify({ v: 1, updated: new Date().toISOString(), records: recs }));
+    let res;
+    if (file) {
+      res = await drive('files/' + file.id, { uploadType: 'media', fields: 'id,modifiedTime' }, false,
+        { method: 'PATCH', headers: { 'Content-Type': 'application/gzip' }, body: blob }, up);
+    } else {
+      const boundary = 'heatmap' + Math.random().toString(36).slice(2);
+      const body = new Blob([
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+        JSON.stringify({ name: TL_FILE, parents: ['appDataFolder'] }) +
+        `\r\n--${boundary}\r\nContent-Type: application/gzip\r\n\r\n`, blob, `\r\n--${boundary}--`]);
+      res = await drive('files', { uploadType: 'multipart', fields: 'id,modifiedTime' }, false,
+        { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body }, up);
+    }
+    store.set('tlSync', res.modifiedTime || ''); store.set('tlDirty', '0');
+    setStatus(`Cronologia salvata su Drive (${(blob.size / 1048576).toFixed(1)} MB): la ritrovi su ogni dispositivo.`);
+    return false;
+  }
+
+  if (file && file.modifiedTime !== store.get('tlSync', '')) {
+    // un altro dispositivo l'ha aggiornata: la prendo da lì, già pronta
+    setStatus('Scarico la Cronologia da Drive…', false, true);
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, { headers: { Authorization: 'Bearer ' + token.value } });
+    if (!res.ok) throw new Error(`Errore Drive (${res.status})`);
+    const data = JSON.parse(await gunzip(await res.arrayBuffer()));
+    for (const r of local) await DB.del(r.name);
+    for (const r of data.records || []) await DB.put({ ...r, source: 'timeline' });
+    store.set('tlSync', file.modifiedTime);
+    setStatus(`Cronologia scaricata da Drive: ${(data.records || []).length} giorni.`);
+    return true;
+  }
+  return false;
+}
+
 async function syncDrive() {
   const btn = $('sync');
   if (btn.disabled) return;
@@ -1582,9 +1662,11 @@ async function syncDrive() {
     await Promise.all([worker(), worker(), worker(), worker()]);
 
     try { await applyRemoteCache(); } catch { /* si aggancia da qui */ }
+    let tlChanged = false;
+    try { tlChanged = await syncTimeline(); } catch { /* riprova alla prossima sincronizzazione */ }
 
-    await reloadFromDb(total > 0);
-    setStatus(total
+    await reloadFromDb(total > 0 || tlChanged);
+    if (!tlChanged) setStatus(total
       ? `Aggiornato: ${updatedNames.slice(0, 4).join(', ')}${total > 4 ? ` e altri ${total - 4}` : ''}` + (bad ? ` (${bad} con errori)` : '') + '.'
       : 'Già tutto aggiornato ✓');
     store.set('lastSync', new Date().toISOString());
