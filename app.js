@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '50';
+const APP_VERSION = '51';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1500,8 +1500,23 @@ function renderDiag(segs) {
 
 // Attività Garmin già caricate come bici ma a passo d'uomo: diventano a piedi
 async function upgradeGarmin() {
-  if (store.get('gaFix', '') === '1') return;
   let changed = 0;
+  // 21/11: la versione 50 calcolava in m/s invece che in km/h la velocità delle uscite senza velocità
+  // registrata e le metteva "a piedi". Sopra i 15 km/h tipici non si cammina né si corre: tornano in bici.
+  if (store.get('gaFix2', '') !== '1') {
+    for (const r of await DB.all()) {
+      if (r.source !== 'garmin' || r.kind !== 'walking') continue;
+      const v = typicalKmh(r.segments.flat(), 5);
+      if (v === null || v < 15) continue;
+      r.kind = 'bicycle';
+      r.segments = r.segments.map((seg) => seg.map((p) => [p[0], p[1], p[2], p[3], 'bicycle', p[5]]));
+      await DB.put(r);
+      changed++;
+    }
+    store.set('gaFix2', '1');
+    store.set('gaFix', ''); // e si rifà la correzione giusta (bici a passo d'uomo → a piedi)
+  }
+  if (store.get('gaFix', '') === '1') { if (changed) store.set('gaDirty', '1'); return; }
   for (const r of await DB.all()) {
     if (r.source !== 'garmin' || r.kind !== 'bicycle') continue;
     const v = typicalKmh(r.segments.flat(), 5);
@@ -1682,12 +1697,14 @@ function typicalKmh(pts, spdIdx) {
   const sp = [];
   for (let i = 1; i < pts.length; i++) {
     let v = pts[i][spdIdx];
-    if (v == null) {
+    if (v != null) {
+      v *= spdIdx === 4 ? 3.6 : 1; // nei FIT è in m/s, nelle tracce salvate già in km/h
+    } else {
+      // velocità non registrata (es. Wahoo, tap-sync): da distanza e tempo, in km/h
       const dt = (pts[i][2] - pts[i - 1][2]) / 1000;
       if (!(dt > 0)) continue;
-      v = haversine(pts[i - 1], pts[i]) / dt;
+      v = haversine(pts[i - 1], pts[i]) / dt * 3.6;
     }
-    v *= spdIdx === 4 ? 3.6 : 1; // nei FIT è in m/s, nelle tracce salvate già in km/h
     if (v > 1) sp.push(v); // le soste non contano
   }
   sp.sort((a, b) => a - b);
@@ -1827,7 +1844,7 @@ async function importGarmin(files) {
         if (a[2] !== null && b[2] !== null && b[2] - a[2] > 120000 && haversine(a, b) > 500) segments.push([]);
         segments[segments.length - 1].push(b);
       }
-      await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, start: pts[0][2], end: pts[pts.length - 1][2], segments: segments.filter((x) => x.length >= 2) });
+      await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, sport: r.sport, start: pts[0][2], end: pts[pts.length - 1][2], segments: segments.filter((x) => x.length >= 2) });
       kept++;
     } catch { skipped++; note('scartate', 'file illeggibile'); }
     if (read % 25 === 0) setStatus(`Garmin: lette ${read} attività, ${kept} con percorso all'aperto…`, false, true);
@@ -2081,7 +2098,7 @@ async function syncBundle(B) {
       return false;
     }
     setStatus(`Salvo ${B.label} su Drive…`);
-    const recs = local.map(({ name, ver, modifiedTime, pv, tlv, segments, match, kind, start, end }) => ({ name, ver, modifiedTime, pv, tlv, segments, match, kind, start, end }));
+    const recs = local.map(({ name, ver, modifiedTime, pv, tlv, segments, match, kind, sport, start, end }) => ({ name, ver, modifiedTime, pv, tlv, segments, match, kind, sport, start, end }));
     const blob = await gzip(JSON.stringify({ v: 1, updated: new Date().toISOString(), records: recs }));
     let res;
     if (file) {
