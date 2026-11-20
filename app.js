@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '48';
+const APP_VERSION = '49';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1593,7 +1593,7 @@ function parseFit(buf) {
   const end = Math.min(buf.byteLength, hs + dv.getUint32(4, true));
   const defs = {};
   const pts = [];
-  let sport = null, sub = null, maker = null, product = null, app = null, trainer = false, lastTs = 0, i = hs;
+  let sport = null, sub = null, maker = null, product = null, app = null, trainer = false, created = null, records = 0, lastTs = 0, i = hs;
   const read = (off, size, le) => size === 1 ? u8[off] : size === 2 ? dv.getUint16(off, le) : size === 4 ? dv.getUint32(off, le) : null;
   while (i < end) {
     const h = u8[i++];
@@ -1627,6 +1627,7 @@ function parseFit(buf) {
     if (v[253] != null && v[253] !== 0xFFFFFFFF) ts = v[253];
     if (ts !== null) lastTs = ts;
     if (def.gm === 20) { // record
+      records++;
       const lat = v[0] != null ? v[0] | 0 : null, lon = v[1] != null ? v[1] | 0 : null;
       if (lat === null || lon === null || lat === 0x7FFFFFFF || lon === 0x7FFFFFFF || (lat === 0 && lon === 0)) continue;
       let alt = v[78] != null && v[78] !== 0xFFFFFFFF ? v[78] / 5 - 500 : v[2] != null && v[2] !== 0xFFFF ? v[2] / 5 - 500 : null;
@@ -1635,6 +1636,7 @@ function parseFit(buf) {
     } else if (def.gm === 0) { // file_id: chi ha registrato il file
       if (v[1] != null && v[1] !== 0xFFFF) maker = v[1];
       if (v[2] != null && v[2] !== 0xFFFF) product = v[2];
+      if (v[4] != null && v[4] !== 0xFFFFFFFF) created = (v[4] + 631065600) * 1000;
       if (typeof v[8] === 'string' && v[8]) app = v[8];
     } else if (def.gm === 23) { // device_info: sensori collegati
       if (v[1] === 17) trainer = true; // "attrezzatura fitness": un rullo (Tacx, KICKR…), quindi uscita indoor
@@ -1644,7 +1646,7 @@ function parseFit(buf) {
       if (sb != null && sb !== 0xFF) sub = sb;
     }
   }
-  return { sport, sub, pts, maker, product, app, trainer };
+  return { sport, sub, pts, maker, product, app, trainer, created, records };
 }
 
 // Chi ha registrato il file (codici produttore FIT). Dispositivi GPS veri: le uscite valgono.
@@ -1752,7 +1754,14 @@ async function importGarmin(files) {
       const r = /\.tcx(\.gz)?$/i.test(name) ? parseTcx(new TextDecoder().decode(buf))
         : /\.gpx(\.gz)?$/i.test(name) ? parseGarminGpx(new TextDecoder().decode(buf), name) : parseFit(buf);
       const kind = r.pts.length >= 10 ? garminKind(r.sport, r.sub, r.pts) : null;
-      if (!kind) { skipped++; note('scartate', r.pts.length < 10 ? 'senza GPS' : FIT_INDOOR.has(r.sub) ? 'indoor/virtuale' : 'altro sport'); return; }
+      if (!kind) {
+        skipped++;
+        if (r.pts.length < 10 && r.sport === 2 && !FIT_INDOOR.has(r.sub)) {
+          // bici senza posizioni lette: da capire (rulli non dichiarati o file che non leggo bene)
+          note('scartate', `bici senza GPS ${r.created ? new Date(r.created).getFullYear() : '?'}${r.records ? '' : ' (0 punti)'}`);
+        } else note('scartate', r.pts.length < 10 ? (r.sport === null ? 'senza GPS (dati giornalieri)' : 'senza GPS') : FIT_INDOOR.has(r.sub) ? 'indoor/virtuale' : 'altro sport');
+        return;
+      }
       // Bici registrata da un programma e non da un dispositivo GPS: quasi sempre un'uscita
       // virtuale (es. Rouvy nel 2015, "in Belgio"), anche se all'epoca non era segnata come tale
       const virtual = r.trainer || FIT_VIRTUAL_MAKERS.has(r.maker) || VIRTUAL_APP.test(r.app || '');
