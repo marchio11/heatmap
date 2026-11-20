@@ -12,7 +12,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-  <link rel="stylesheet" href="style.css?v=42">
+  <link rel="stylesheet" href="style.css?v=43">
 </head>
 <body>
   <div id="map"></div>
@@ -35,6 +35,7 @@
       <div class="stats">
         <label class="toggle" title="Mostra o nascondi sulla mappa"><span class="lbl"><input id="showWalk" type="checkbox"> 🚶 A piedi</span><span id="kmWalk" class="val">–</span></label>
         <label class="toggle" title="Mostra o nascondi sulla mappa"><span class="lbl"><input id="showVehicle" type="checkbox" checked> 🚗 Veicoli</span><span id="kmVehicle" class="val">–</span></label>
+        <label id="rowBike" class="toggle" title="Uscite in bici registrate con Garmin" hidden><span class="lbl"><input id="showBike" type="checkbox"> 🚴 Bici</span><span id="kmBike" class="val">–</span></label>
         <label id="rowTimeline" class="toggle" title="Viaggi in auto ricostruiti dalla Cronologia di Google Maps (stimati)" hidden><span class="lbl"><input id="showTimeline" type="checkbox" checked> 📜 Cronologia Google</span><span id="kmTimeline" class="val">–</span></label>
         <div><span class="lbl">📅 Giorni registrati</span><span id="days" class="val">–</span></div>
         <div id="recHigh" class="rec" title="Mostra sulla mappa"><span class="lbl">⛰️ Punto più alto</span><span id="high" class="val">–</span></div>
@@ -48,8 +49,8 @@
         <div class="actions">
           <button id="sync" class="primary">Accedi e sincronizza Drive</button>
           <label class="btn">
-            Carica GPX o Cronologia Google (.json)
-            <input id="fileInput" type="file" accept=".gpx,application/gpx+xml,.json,application/json" multiple hidden>
+            Carica GPX, Cronologia Google (.json) o Garmin (.zip, .fit)
+            <input id="fileInput" type="file" accept=".gpx,application/gpx+xml,.json,application/json,.zip,application/zip,.fit,.tcx" multiple hidden>
           </label>
         </div>
 
@@ -63,6 +64,7 @@
           <span>Aggancia alle strade i percorsi in auto <small>(usa il server pubblico gratuito di OSRM)</small></span>
         </label>
         <button id="clearTimeline" class="danger" hidden>Rimuovi Cronologia Google</button>
+        <button id="clearGarmin" class="danger" hidden>Rimuovi attività Garmin</button>
         <button id="clear" class="danger">Cancella i dati salvati nel browser</button>
         <p id="diag" class="hint"></p>
         <p class="hint">Versione app: <span id="ver"></span></p>
@@ -75,6 +77,6 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="app.js?v=42"></script>
+  <script src="app.js?v=43"></script>
 </body>
 </html>

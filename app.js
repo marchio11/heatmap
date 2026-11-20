@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '42';
+const APP_VERSION = '43';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -259,7 +259,7 @@ function classify(pts) {
     const v = b[5] ?? (dt > 0 ? d / dt * 3.6 : null);
     legs.push({ d, v: dt > 0 ? v : null, mid: dt > 0 ? (a[2] + b[2]) / 2 : null, act: b[4] || a[4] || null });
   }
-  const km = { walk: 0, vehicle: 0 };
+  const km = { walk: 0, vehicle: 0, bike: 0 };
   // A piedi il rumore del GPS allunga molto la traccia: se c'è la velocità misurata,
   // un tratto non può essere più lungo di quanto quella velocità permette (con margine)
   const walkLen = (i) => {
@@ -275,8 +275,9 @@ function classify(pts) {
     // Modo riconosciuto dal telefono (Heatlogger): ha la precedenza sulla stima dalla velocità.
     // "Fermo" non dice con che mezzo ti muovi (al semaforo in auto è "fermo"): lì decide la velocità.
     const onFoot = leg.act === 'walking' || leg.act === 'running';
-    const inVehicle = leg.act === 'vehicle' || leg.act === 'bicycle';
+    const inVehicle = leg.act === 'vehicle';
     if (onFoot) { modes.push('w'); continue; }
+    if (leg.act === 'bicycle') { modes.push('b'); continue; }
     if (inVehicle) { modes.push('v'); continue; } // anche se lenta: coda, camper in salita
     if (leg.mid === null) { modes.push('w'); continue; }
     while (lo < i && (legs[lo].mid === null || legs[lo].mid < leg.mid - MODE_WINDOW_MS)) lo++;
@@ -291,6 +292,7 @@ function classify(pts) {
   smoothModes(pts, modes);
   for (let i = 0; i < legs.length; i++) {
     if (modes[i] === 'v') km.vehicle += legs[i].d / 1000;
+    else if (modes[i] === 'b') km.bike += legs[i].d / 1000;
     else km.walk += walkLen(i) / 1000;
   }
   return { km, modes };
@@ -538,7 +540,7 @@ async function matchPending() {
     for (;;) {
       const all = await DB.all();
       const covered = hiddenTimeline(all);
-      const todo = all.filter((r) => (!matchValid(r) || (r.source === 'timeline' && r.match.segs.flat().some((x) => x && stale(x)))) && !covered(r));
+      const todo = all.filter((r) => r.source !== 'garmin' && (!matchValid(r) || (r.source === 'timeline' && r.match.segs.flat().some((x) => x && stale(x)))) && !covered(r));
       if (!todo.length) break;
       const known = knownRuns(all);
       let done = 0;
@@ -612,14 +614,14 @@ function bboxOf(path) {
 
 // Divide una traccia in pezzi "a piedi" e "in veicolo" (per il filtro della mappa).
 // Nei pezzi in veicolo i tratti agganciati alle strade sostituiscono i punti GPS.
-function splitByMode(pts, modes, runs, day, timeline = false) {
+function splitByMode(pts, modes, runs, day, timeline = false, garmin = false) {
   const raw = timeline ? new Set(pts.map((q) => q[0] + ',' + q[1])) : null;
   const pieces = [];
   let s = 0;
   for (let i = 1; i <= modes.length; i++) {
     if (i < modes.length && modes[i] === modes[s]) continue;
     const e = i; // pezzo dai punti s..e (tratti s..e-1)
-    const m = modes[s] === 'v' ? 'v' : 'w';
+    const m = modes[s] === 'v' || modes[s] === 'b' ? modes[s] : 'w';
     let path = [];
     if (m === 'v' && runs && runs.length) {
       let j = s;
@@ -646,14 +648,14 @@ function splitByMode(pts, modes, runs, day, timeline = false) {
       }
       parts.push(cur);
     }
-    for (const pp of parts) if (pp.length >= 2) pieces.push({ m, path: pp, day, bbox: bboxOf(pp) });
+    for (const pp of parts) if (pp.length >= 2) pieces.push({ m, path: pp, day, bbox: bboxOf(pp), garmin });
     s = i;
   }
   return pieces;
 }
 
 // Filtro della mappa: a piedi / in veicolo (all'apertura sempre entrambi)
-const show = { w: false, v: true, t: true }; // all'apertura: solo veicoli
+const show = { w: false, v: true, t: true, b: false }; // all'apertura: solo veicoli
 const visiblePieces = (segs) => segs.flatMap((s) => s.timeline && !show.t ? [] : s.pieces.filter((p) => show[p.m]));
 
 // Cronologia Google: solo i viaggi in auto, uno per "segmento", raggruppati per giorno
@@ -874,7 +876,7 @@ function parseTimeline(text) {
 function hiddenTimeline(records) {
   const gpxDays = new Set();
   for (const rec of records) {
-    if (rec.source === 'timeline') continue;
+    if (rec.source === 'timeline' || rec.source === 'garmin') continue;
     for (const pts of rec.segments) {
       if (pts[0][2] === null) continue;
       const d = new Date(pts[0][2]);
@@ -887,6 +889,19 @@ function hiddenTimeline(records) {
 function buildIndex(records) {
   const segs = [];
   const covered = hiddenTimeline(records);
+  // Viaggi "in auto" della Cronologia che coincidono con un'attività Garmin: erano uscite in bici
+  // o escursioni etichettate male da Google
+  const garminSpans = records.filter((r) => r.source === 'garmin').map((r) => [r.start, r.end]).sort((a, b) => a[0] - b[0]);
+  const duringGarmin = (pts) => {
+    const t0 = pts[0][2], t1 = pts[pts.length - 1][2];
+    if (t0 === null || t1 === null || t1 <= t0) return false;
+    let overlap = 0;
+    for (const [a, b] of garminSpans) {
+      if (a > t1) break;
+      overlap += Math.max(0, Math.min(b, t1) - Math.max(a, t0));
+    }
+    return overlap > 0.5 * (t1 - t0);
+  };
   for (const rec of records) {
     const timeline = rec.source === 'timeline';
     if (covered(rec)) continue;
@@ -902,6 +917,7 @@ function buildIndex(records) {
       } else {
         day = 'senza data';
       }
+      if (timeline && garminSpans.length && duringGarmin(pts)) return;
       // raccordo della Cronologia non ricostruibile sulle strade: meglio niente che una linea dritta
       if (timeline && pts.length === 2 && !(matched && matched[k] && matched[k][0] && matched[k][0].coords)) return;
       const { km, modes } = classify(pts);
@@ -928,9 +944,10 @@ function buildIndex(records) {
       segs.push({
         path,
         timeline,
+        garmin: rec.source === 'garmin',
         raw: timeline ? pts : null,
         // Cronologia: le quote sono chieste per i punti veri, non per i percorsi ricostruiti
-        pieces: splitByMode(pts, modes, runs, day, timeline),
+        pieces: splitByMode(pts, modes, runs, day, timeline, rec.source === 'garmin'),
         runs: runs || [],
         day,
         year: day.slice(0, 4),
@@ -1158,6 +1175,7 @@ function elevationTargets() {
   };
   const elev = (p) => elevCache[cellKey(p)] ?? -9999;
   for (const seg of allSegments) {
+    if (seg.garmin) continue; // l'altitudine c'è già, registrata dal Garmin
     for (const pc of seg.pieces) {
       // niente punto di partenza (quasi sempre casa o lavoro): basta l'arrivo, che conta (es. parcheggi in cima ai colli)
       const coarse = samplePath(pc.path, ELEV_COARSE, () => true, false);
@@ -1361,7 +1379,7 @@ function renderRecords() {
   let high = null, far = null;
   for (const seg of visiblePieces(currentSegments())) {
     for (const p of seg.path) {
-      const e = elevAt(p);
+      const e = seg.garmin ? p[3] ?? undefined : elevAt(p);
       if (e !== undefined && e > -9000 && (!high || e > high.e)) high = { e, p, day: seg.day };
     }
     for (const p of seg.path) {
@@ -1433,15 +1451,20 @@ function render(fit) {
   const segs = currentSegments();
   heat.setSegments(visiblePieces(segs));
 
-  let walk = 0, vehicle = 0, tl = 0;
+  let walk = 0, vehicle = 0, tl = 0, bike = 0;
   const days = new Set();
   for (const s of segs) {
     if (s.timeline) { tl += s.km.vehicle; if (show.t) days.add(s.day); continue; }
-    walk += s.km.walk; vehicle += s.km.vehicle; days.add(s.day);
+    walk += s.km.walk; vehicle += s.km.vehicle; bike += s.km.bike || 0;
+    if (!s.garmin || (s.km.bike ? show.b : show.w)) days.add(s.day);
   }
   const hasTl = allSegments.some((s) => s.timeline);
+  const hasGarmin = allSegments.some((s) => s.garmin);
   $('rowTimeline').hidden = !hasTl;
   $('clearTimeline').hidden = !hasTl;
+  $('rowBike').hidden = !hasGarmin && !bike;
+  $('clearGarmin').hidden = !hasGarmin;
+  $('kmBike').textContent = fmtKm(bike);
   $('kmWalk').textContent = segs.length ? fmtKm(walk) : '–';
   $('kmVehicle').textContent = segs.length ? fmtKm(vehicle) : '–';
   $('kmTimeline').textContent = fmtKm(tl);
@@ -1487,7 +1510,7 @@ async function reloadFromDb(fit) {
 
 $('ver').textContent = APP_VERSION;
 
-for (const [id, m] of [['showWalk', 'w'], ['showVehicle', 'v'], ['showTimeline', 't']]) {
+for (const [id, m] of [['showWalk', 'w'], ['showVehicle', 'v'], ['showTimeline', 't'], ['showBike', 'b']]) {
   $(id).addEventListener('change', (e) => { show[m] = e.target.checked; render(false); });
 }
 
@@ -1559,8 +1582,174 @@ $('clearTimeline').addEventListener('click', async () => {
   setStatus('Cronologia Google rimossa.');
 });
 
+/* ---------------- Garmin: bici ed escursioni dai file FIT ---------------- */
+
+// Lettore minimo del formato FIT (binario Garmin): servono solo posizioni, orari, quote e sport.
+const FIT_INDOOR = new Set([6, 58]); // sub_sport: rulli (indoor_cycling), attività virtuale (Zwift e simili)
+function parseFit(buf) {
+  const dv = new DataView(buf), u8 = new Uint8Array(buf);
+  const hs = u8[0];
+  if (buf.byteLength < 14 || String.fromCharCode(u8[8], u8[9], u8[10], u8[11]) !== '.FIT') throw new Error('non FIT');
+  const end = Math.min(buf.byteLength, hs + dv.getUint32(4, true));
+  const defs = {};
+  const pts = [];
+  let sport = null, sub = null, lastTs = 0, i = hs;
+  const read = (off, size, le) => size === 1 ? u8[off] : size === 2 ? dv.getUint16(off, le) : size === 4 ? dv.getUint32(off, le) : null;
+  while (i < end) {
+    const h = u8[i++];
+    let def, ts = null;
+    if (h & 0x80) { // orario compresso
+      def = defs[(h >> 5) & 3];
+      const off = h & 0x1f;
+      ts = (lastTs & ~0x1f) + off + (off < (lastTs & 0x1f) ? 0x20 : 0);
+    } else if (h & 0x40) { // definizione
+      const le = u8[i + 1] === 0, gm = le ? dv.getUint16(i + 2, true) : dv.getUint16(i + 2, false), n = u8[i + 4];
+      i += 5;
+      const fields = [];
+      for (let k = 0; k < n; k++) fields.push([u8[i + 3 * k], u8[i + 3 * k + 1]]);
+      i += 3 * n;
+      let devSize = 0;
+      if (h & 0x20) { const nd = u8[i++]; for (let k = 0; k < nd; k++) devSize += u8[i + 3 * k + 1]; i += 3 * nd; }
+      defs[h & 0xf] = { gm, le, fields, devSize };
+      continue;
+    } else def = defs[h & 0xf];
+    if (!def) throw new Error('FIT non valido');
+    const v = {};
+    for (const [num, size] of def.fields) { v[num] = read(i, size, def.le); i += size; }
+    i += def.devSize;
+    if (v[253] != null && v[253] !== 0xFFFFFFFF) ts = v[253];
+    if (ts !== null) lastTs = ts;
+    if (def.gm === 20) { // record
+      const lat = v[0] != null ? v[0] | 0 : null, lon = v[1] != null ? v[1] | 0 : null;
+      if (lat === null || lon === null || lat === 0x7FFFFFFF || lon === 0x7FFFFFFF || (lat === 0 && lon === 0)) continue;
+      let alt = v[78] != null && v[78] !== 0xFFFFFFFF ? v[78] / 5 - 500 : v[2] != null && v[2] !== 0xFFFF ? v[2] / 5 - 500 : null;
+      const spd = v[73] != null && v[73] !== 0xFFFFFFFF ? v[73] / 1000 : v[6] != null && v[6] !== 0xFFFF ? v[6] / 1000 : null;
+      pts.push([lat * 180 / 2 ** 31, lon * 180 / 2 ** 31, ts !== null ? (ts + 631065600) * 1000 : null, alt, spd]);
+    } else if (def.gm === 18 || def.gm === 12) { // session / sport
+      const sp = def.gm === 18 ? v[5] : v[0], sb = def.gm === 18 ? v[6] : v[1];
+      if (sp != null && sp !== 0xFF) sport = sp;
+      if (sb != null && sb !== 0xFF) sub = sb;
+    }
+  }
+  return { sport, sub, pts };
+}
+
+// Sport Garmin → categoria della heatmap
+function garminKind(sport, sub, pts) {
+  if (FIT_INDOOR.has(sub)) return null;
+  if (sport === 2 || sport === 21) return 'bicycle'; // ciclismo (strada, MTB, gravel), e-bike
+  if ([1, 11, 16, 17].includes(sport)) return 'walking'; // corsa, camminata, alpinismo, escursionismo
+  if (sport === 0 || sport === null) {
+    // "generico": decide la velocità tipica (a piedi sotto i 7 km/h)
+    const sp = pts.map((p) => p[4]).filter((x) => x != null).sort((a, b) => a - b);
+    const med = sp.length ? sp[sp.length >> 1] * 3.6 : null;
+    return med !== null && med < 7 ? 'walking' : null;
+  }
+  return null; // nuoto, sci, palestra…
+}
+
+// Le tracce Garmin hanno un punto al secondo: tengo un punto ogni 15 m (sulla mappa non cambia nulla)
+function thinTrack(pts, act) {
+  const out = [];
+  for (const p of pts) {
+    const last = out[out.length - 1];
+    if (last && haversine(last, p) < 15) continue;
+    out.push([Math.round(p[0] * 1e6) / 1e6, Math.round(p[1] * 1e6) / 1e6, p[2], p[3] !== null ? Math.round(p[3] * 10) / 10 : null, act, p[4] !== null ? Math.round(p[4] * 36) / 10 : null]);
+  }
+  const lastIn = pts[pts.length - 1], lastOut = out[out.length - 1];
+  if (lastIn && lastOut && lastIn[2] !== lastOut[2]) out.push([lastIn[0], lastIn[1], lastIn[2], lastIn[3], act, null]);
+  return out;
+}
+
+// TCX (vecchi file Garmin): sport e punti
+function parseTcx(text) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  const act = doc.getElementsByTagName('Activity')[0];
+  const sp = (act && act.getAttribute('Sport') || '').toLowerCase();
+  const pts = [];
+  for (const tp of doc.getElementsByTagName('Trackpoint')) {
+    const g = (n) => tp.getElementsByTagName(n)[0]?.textContent;
+    const lat = parseFloat(g('LatitudeDegrees')), lon = parseFloat(g('LongitudeDegrees'));
+    if (!isFinite(lat) || !isFinite(lon)) continue;
+    const alt = parseFloat(g('AltitudeMeters'));
+    pts.push([lat, lon, Date.parse(g('Time')) || null, isFinite(alt) ? alt : null, null]);
+  }
+  return { sport: sp === 'biking' ? 2 : sp === 'running' ? 1 : 0, sub: null, pts };
+}
+
+let jszipLoading = null;
+function loadJSZip() {
+  if (window.JSZip) return Promise.resolve();
+  if (!jszipLoading) jszipLoading = new Promise((resolve, reject) => {
+    const sc = document.createElement('script');
+    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+    sc.onload = resolve; sc.onerror = () => reject(new Error('libreria ZIP non disponibile'));
+    document.head.appendChild(sc);
+  });
+  return jszipLoading;
+}
+
+async function importGarmin(files) {
+  let read = 0, kept = 0, skipped = 0;
+  const seen = new Set((await DB.all()).filter((r) => r.source === 'garmin').map((r) => r.name));
+  const handle = async (name, getBuf) => {
+    read++;
+    try {
+      let buf = await getBuf();
+      if (/\.gz$/i.test(name)) buf = await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+      const r = /\.tcx(\.gz)?$/i.test(name) ? parseTcx(new TextDecoder().decode(buf)) : parseFit(buf);
+      const kind = r.pts.length >= 10 ? garminKind(r.sport, r.sub, r.pts) : null;
+      if (!kind) { skipped++; return; }
+      const pts = thinTrack(r.pts, kind);
+      if (pts.length < 2 || pts[0][2] === null) { skipped++; return; }
+      const id = 'garmin-' + pts[0][2];
+      if (seen.has(id)) return; // già caricata (stessa ora di partenza)
+      seen.add(id);
+      await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, start: pts[0][2], end: pts[pts.length - 1][2], segments: [pts] });
+      kept++;
+    } catch { skipped++; }
+    if (read % 25 === 0) setStatus(`Garmin: lette ${read} attività, ${kept} con percorso all'aperto…`, false, true);
+  };
+  const walkZip = async (zip) => {
+    for (const entry of Object.values(zip.files)) {
+      if (entry.dir) continue;
+      if (/\.zip$/i.test(entry.name)) { await walkZip(await JSZip.loadAsync(await entry.async('uint8array'))); continue; }
+      if (/\.(fit|tcx)(\.gz)?$/i.test(entry.name)) await handle(entry.name, () => entry.async('arraybuffer'));
+    }
+  };
+  try {
+    for (const f of files) {
+      if (/\.zip$/i.test(f.name)) {
+        setStatus('Garmin: apro lo ZIP…', false, true);
+        await loadJSZip();
+        await walkZip(await JSZip.loadAsync(f));
+      } else await handle(f.name, () => f.arrayBuffer());
+    }
+    if (kept) store.set('gaDirty', '1');
+    await reloadFromDb(true);
+    setStatus(`Garmin: ${kept} attività all'aperto aggiunte su ${read} lette (scartate ${skipped}: indoor, virtuali, senza GPS o altri sport).`, false, true);
+    if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
+  } catch (err) {
+    setStatus('Garmin: ' + err.message, true);
+  }
+}
+
+async function removeGarmin() {
+  for (const r of await DB.all()) if (r.source === 'garmin') await DB.del(r.name);
+  store.set('gaDirty', '1');
+}
+$('clearGarmin').addEventListener('click', async () => {
+  if (!confirm('Togliere dalla mappa tutte le attività Garmin, anche dalla copia su Drive (quindi da tutti i dispositivi)?')) return;
+  await removeGarmin();
+  await reloadFromDb(false);
+  setStatus('Attività Garmin rimosse.');
+  if (canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
+});
+
 async function importFiles(files) {
   let ok = 0, bad = 0;
+  const garminFiles = files.filter((f) => /\.(zip|fit|tcx)$/i.test(f.name));
+  if (garminFiles.length) await importGarmin(garminFiles);
   for (const f of files) {
     if (/\.json$/i.test(f.name)) { await importTimeline(f); continue; }
     if (!/\.gpx$/i.test(f.name)) continue;
@@ -1742,22 +1931,32 @@ async function findTimelineFile() {
   return files[0] || null;
 }
 
+// Pacchetti salvati su Drive: la Cronologia (ricostruita) e le attività Garmin
+const TL_BUNDLE = { src: 'timeline', file: TL_FILE, dirty: 'tlDirty', sync: 'tlSync', label: 'Cronologia' };
+const GARMIN_BUNDLE = { src: 'garmin', file: 'garmin.json.gz', dirty: 'gaDirty', sync: 'gaSync', label: 'attività Garmin' };
+
 async function syncTimeline(fromMatch = false) {
-  if (!canUseAppData() || typeof CompressionStream === 'undefined' || (matching && !fromMatch)) return false;
-  const file = await findTimelineFile();
-  const local = (await DB.all()).filter((r) => r.source === 'timeline');
+  if (matching && !fromMatch) return false;
+  return syncBundle(TL_BUNDLE);
+}
+
+async function syncBundle(B) {
+  if (!canUseAppData() || typeof CompressionStream === 'undefined') return false;
+  const files = await listAll(`name = '${B.file}' and trashed = false`, 'id,name,modifiedTime', 'appDataFolder');
+  const file = files[0] || null;
+  const local = (await DB.all()).filter((r) => r.source === B.src);
   const up = 'https://www.googleapis.com/upload/drive/v3/';
-  const dirty = store.get('tlDirty', '0') === '1' || (!file && local.length && !store.get('tlSync', ''));
+  const dirty = store.get(B.dirty, '0') === '1' || (!file && local.length && !store.get(B.sync, ''));
 
   if (dirty) {
     // le modifiche fatte qui (caricamento, ricostruzione, pulizia, rimozione) vanno su Drive
     if (!local.length) {
       if (file) await drive('files/' + file.id, {}, true, { method: 'DELETE' });
-      store.set('tlSync', ''); store.set('tlDirty', '0');
+      store.set(B.sync, ''); store.set(B.dirty, '0');
       return false;
     }
-    setStatus('Salvo la Cronologia su Drive…');
-    const recs = local.map((r) => ({ name: r.name, ver: r.ver, modifiedTime: r.modifiedTime, pv: r.pv, tlv: r.tlv, segments: r.segments, match: r.match }));
+    setStatus(`Salvo ${B.label} su Drive…`);
+    const recs = local.map(({ name, ver, modifiedTime, pv, tlv, segments, match, kind, start, end }) => ({ name, ver, modifiedTime, pv, tlv, segments, match, kind, start, end }));
     const blob = await gzip(JSON.stringify({ v: 1, updated: new Date().toISOString(), records: recs }));
     let res;
     if (file) {
@@ -1767,26 +1966,26 @@ async function syncTimeline(fromMatch = false) {
       const boundary = 'heatmap' + Math.random().toString(36).slice(2);
       const body = new Blob([
         `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
-        JSON.stringify({ name: TL_FILE, parents: ['appDataFolder'] }) +
+        JSON.stringify({ name: B.file, parents: ['appDataFolder'] }) +
         `\r\n--${boundary}\r\nContent-Type: application/gzip\r\n\r\n`, blob, `\r\n--${boundary}--`]);
       res = await drive('files', { uploadType: 'multipart', fields: 'id,modifiedTime' }, false,
         { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body }, up);
     }
-    store.set('tlSync', res.modifiedTime || ''); store.set('tlDirty', '0');
-    setStatus(`Cronologia salvata su Drive (${(blob.size / 1048576).toFixed(1)} MB): la ritrovi su ogni dispositivo.`);
+    store.set(B.sync, res.modifiedTime || ''); store.set(B.dirty, '0');
+    setStatus(`${B.label[0].toUpperCase() + B.label.slice(1)} salvata su Drive (${(blob.size / 1048576).toFixed(1)} MB): la ritrovi su ogni dispositivo.`);
     return false;
   }
 
-  if (file && file.modifiedTime !== store.get('tlSync', '')) {
+  if (file && file.modifiedTime !== store.get(B.sync, '')) {
     // un altro dispositivo l'ha aggiornata: la prendo da lì, già pronta
-    setStatus('Scarico la Cronologia da Drive…', false, true);
+    setStatus(`Scarico ${B.label} da Drive…`, false, true);
     const res = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, { headers: { Authorization: 'Bearer ' + token.value } });
     if (!res.ok) throw new Error(`Errore Drive (${res.status})`);
     const data = JSON.parse(await gunzip(await res.arrayBuffer()));
     for (const r of local) await DB.del(r.name);
-    for (const r of data.records || []) await DB.put({ ...r, source: 'timeline' });
-    store.set('tlSync', file.modifiedTime);
-    setStatus(`Cronologia scaricata da Drive: ${(data.records || []).length} giorni.`);
+    for (const r of data.records || []) await DB.put({ ...r, source: B.src });
+    store.set(B.sync, file.modifiedTime);
+    setStatus(`Scaricate da Drive: ${B.label} (${(data.records || []).length}).`);
     return true;
   }
   return false;
@@ -1856,6 +2055,7 @@ async function syncDrive() {
     try { await applyRemoteCache(); } catch { /* si aggancia da qui */ }
     let tlChanged = false;
     try { tlChanged = await syncTimeline(); } catch { /* riprova alla prossima sincronizzazione */ }
+    try { tlChanged = (await syncBundle(GARMIN_BUNDLE)) || tlChanged; } catch { /* riprova alla prossima sincronizzazione */ }
 
     await reloadFromDb(total > 0 || tlChanged);
     if (!tlChanged) setStatus(total
