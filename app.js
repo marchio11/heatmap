@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '37';
+const APP_VERSION = '38';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -884,41 +884,6 @@ function hiddenTimeline(records) {
   return (rec) => rec.source === 'timeline' && gpxDays.has(rec.name.slice(TL_PREFIX.length));
 }
 
-// Cronologia: per il punto più alto valgono solo i punti vicini alla strada ricostruita.
-// Google a volte mette un punto "in auto" in mezzo ai monti (es. 11/7, verso la Cima di Stilves).
-const ROAD_MAX_M = 150;
-const roadCache = new Map();
-function roadPoints(pts, runs) {
-  const run = runs && runs[0];
-  if (!run || !run.coords) return []; // percorso non ricostruito: quote non affidabili
-  const key = run.k || null;
-  if (key && roadCache.has(key)) return roadCache.get(key);
-  // griglia di celle da circa 200 m con i pezzi di strada che le toccano
-  const cell = (p) => Math.floor(p[0] * 500) + ':' + Math.floor(p[1] * 500);
-  const grid = new Map();
-  const c = run.coords;
-  for (let i = 1; i < c.length; i++) {
-    const a = c[i - 1], b = c[i];
-    const n = Math.max(1, Math.ceil(haversine(a, b) / 150));
-    for (let j = 0; j <= n; j++) {
-      const q = [a[0] + (b[0] - a[0]) * j / n, a[1] + (b[1] - a[1]) * j / n];
-      const k = cell(q);
-      if (!grid.has(k)) grid.set(k, []);
-      grid.get(k).push(q);
-    }
-  }
-  const near = (p) => {
-    const r = Math.floor(p[0] * 500), l = Math.floor(p[1] * 500);
-    for (let dr = -1; dr <= 1; dr++) for (let dl = -1; dl <= 1; dl++) {
-      for (const q of grid.get((r + dr) + ':' + (l + dl)) || []) if (haversine(p, q) <= ROAD_MAX_M) return true;
-    }
-    return false;
-  };
-  const out = pts.filter(near);
-  if (key) roadCache.set(key, out);
-  return out;
-}
-
 function buildIndex(records) {
   const segs = [];
   const covered = hiddenTimeline(records);
@@ -965,7 +930,7 @@ function buildIndex(records) {
         timeline,
         raw: timeline ? pts : null,
         // Cronologia: le quote sono chieste per i punti veri, non per i percorsi ricostruiti
-        pieces: splitByMode(pts, modes, runs, day, timeline).map((pc) => timeline ? { ...pc, elev: roadPoints(pts, runs) } : pc),
+        pieces: splitByMode(pts, modes, runs, day, timeline),
         runs: runs || [],
         day,
         year: day.slice(0, 4),
@@ -1116,23 +1081,94 @@ const heat = new HeatLayer().addTo(map);
 // più affidabili dell'altitudine GPS. Ogni "cella" di circa 50 m viene chiesta una volta sola.
 const ELEV_CELL = 2000;
 const cellKey = (p) => Math.round(p[0] * ELEV_CELL) + ',' + Math.round(p[1] * ELEV_CELL);
+// Le quote stanno in un database a parte del browser (IndexedDB): nel "localStorage" (5 MB)
+// col vecchio backup non ci stavano più e venivano richieste ogni volta (20/11)
 let elevCache = {};
-try { elevCache = JSON.parse(store.get('elev', '{}')) || {}; } catch { elevCache = {}; }
+const ElevDB = {
+  _db: null,
+  async open() {
+    if (this._db !== null) return this._db;
+    this._db = await new Promise((resolve) => {
+      try {
+        const req = indexedDB.open('heatmap-elev', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('cells');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(false);
+      } catch { resolve(false); }
+    });
+    return this._db;
+  },
+  async load() {
+    const db = await this.open();
+    if (!db) return;
+    await new Promise((resolve) => {
+      const tx = db.transaction('cells', 'readonly');
+      const req = tx.objectStore('cells').openCursor();
+      req.onsuccess = () => { const c = req.result; if (c) { elevCache[c.key] = c.value; c.continue(); } else resolve(); };
+      req.onerror = () => resolve();
+    });
+  },
+  async putMany(entries) {
+    const db = await this.open();
+    if (!db || !entries.length) return;
+    await new Promise((resolve) => {
+      const tx = db.transaction('cells', 'readwrite');
+      const st = tx.objectStore('cells');
+      for (const [k, v] of entries) st.put(v, k);
+      tx.oncomplete = tx.onerror = () => resolve();
+    });
+  },
+};
+let elevLoaded = null;
+function loadElevations() {
+  if (!elevLoaded) elevLoaded = (async () => {
+    // trasloco dal vecchio posto
+    try {
+      const old = JSON.parse(store.get('elev', 'null'));
+      if (old && typeof old === 'object') { await ElevDB.putMany(Object.entries(old)); localStorage.removeItem('elev'); }
+    } catch { /* niente da traslocare */ }
+    await ElevDB.load();
+  })();
+  return elevLoaded;
+}
 let elevBusy = false;
 let elevRetry = null;
+
+// Dove chiedere la quota: lungo i percorsi (che stanno sulle strade) un punto ogni km; dove si
+// superano i 1.200 m, un punto ogni 100 m nei 3 km intorno, per prendere la cima dei colli.
+const ELEV_STEP = 1000, ELEV_FINE = 100, ELEV_HIGH = 1200, ELEV_NEAR = 3000;
+function samplePath(path, step, keep = () => true) {
+  const out = [];
+  let acc = step;
+  for (let i = 0; i < path.length; i++) {
+    if (i) acc += haversine(path[i - 1], path[i]);
+    if (acc >= step && keep(path[i])) { out.push(path[i]); acc = 0; }
+  }
+  return out;
+}
+function elevationTargets() {
+  const missing = new Map();
+  const want = (p) => { const k = cellKey(p); if (!(k in elevCache) && !missing.has(k)) missing.set(k, p); };
+  for (const seg of allSegments) {
+    for (const pc of seg.pieces) {
+      const coarse = samplePath(pc.path, ELEV_STEP);
+      coarse.forEach(want);
+      want(pc.path[pc.path.length - 1]);
+      const high = coarse.filter((p) => (elevCache[cellKey(p)] ?? -9999) >= ELEV_HIGH);
+      if (high.length) samplePath(pc.path, ELEV_FINE, (p) => high.some((h) => haversine(h, p) <= ELEV_NEAR)).forEach(want);
+    }
+  }
+  return missing;
+}
 
 async function fillElevations() {
   if (elevBusy) return;
   elevBusy = true;
   try {
-    const missing = new Map();
-    for (const seg of allSegments) {
-      for (const p of seg.raw || seg.path) { // Cronologia: solo i punti veri, non i percorsi ricostruiti
-        const k = cellKey(p);
-        if (!(k in elevCache) && !missing.has(k)) missing.set(k, p);
-      }
-    }
-    const list = [...missing.entries()];
+    await loadElevations();
+   for (let round = 0; round < 3; round++) {
+    const list = [...elevationTargets().entries()];
+    if (!list.length) break;
     for (let i = 0; i < list.length; i += 100) {
       const batch = list.slice(i, i + 100);
       const url = 'https://api.open-meteo.com/v1/elevation?latitude=' +
@@ -1142,18 +1178,21 @@ async function fillElevations() {
       const res = await fetch(url);
       if (!res.ok) throw new Error('quote non disponibili');
       const json = await res.json();
+      const got = [];
       batch.forEach(([k], n) => {
         const e = json.elevation && json.elevation[n];
-        if (typeof e === 'number' && isFinite(e)) elevCache[k] = Math.round(e);
+        elevCache[k] = typeof e === 'number' && isFinite(e) ? Math.round(e) : -9999; // -9999: mare/sconosciuto
+        got.push([k, elevCache[k]]);
       });
-      store.set('elev', JSON.stringify(elevCache));
+      await ElevDB.putMany(got);
       if (list.length > 300) setStatus(`Calcolo le quote… ${Math.min(i + 100, list.length)}/${list.length}`);
       if ((i / 100) % 10 === 9) renderRecords(); // il record si aggiorna strada facendo
       // Open-Meteo gratuito: max 600 "chiamate" al minuto, e 100 luoghi contano come 10 chiamate
       await sleep(1100);
     }
-    if (list.length) renderRecords();
+    renderRecords();
     if (list.length > 300) setStatus('Quote calcolate: punto più alto aggiornato.');
+   }
   } catch {
     // limite del servizio o pagina sospesa: riprovo tra un minuto (quello già fatto è salvato)
     clearTimeout(elevRetry);
@@ -1190,9 +1229,9 @@ function renderRecords() {
   const home = getHome();
   let high = null, far = null;
   for (const seg of visiblePieces(currentSegments())) {
-    for (const p of seg.elev || seg.path) {
+    for (const p of seg.path) {
       const e = elevCache[cellKey(p)];
-      if (e !== undefined && (!high || e > high.e)) high = { e, p, day: seg.day };
+      if (e !== undefined && e > -9000 && (!high || e > high.e)) high = { e, p, day: seg.day };
     }
     for (const p of seg.path) {
       if (home) {
@@ -1306,6 +1345,7 @@ function renderDiag(segs) {
 }
 
 async function reloadFromDb(fit) {
+  await loadElevations();
   await upgradeTimeline();
   buildIndex(await DB.all());
   refreshYears();
