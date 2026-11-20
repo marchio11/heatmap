@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '47';
+const APP_VERSION = '48';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1684,6 +1684,31 @@ function thinTrack(pts, act) {
   return out;
 }
 
+// GPX caricati su Garmin da altre app: sport dal tag <type> o dal nome, altrimenti dalla velocità
+function parseGarminGpx(text, name) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  const type = ((doc.getElementsByTagName('type')[0]?.textContent || '') + ' ' + name).toLowerCase();
+  const pts = [];
+  for (const el of doc.getElementsByTagName('trkpt')) {
+    const lat = parseFloat(el.getAttribute('lat')), lon = parseFloat(el.getAttribute('lon'));
+    if (!isFinite(lat) || !isFinite(lon)) continue;
+    const ele = parseFloat(el.getElementsByTagName('ele')[0]?.textContent);
+    pts.push([lat, lon, Date.parse(el.getElementsByTagName('time')[0]?.textContent) || null, isFinite(ele) ? ele : null, null]);
+  }
+  // velocità tra i punti (km/h → m/s come nei FIT) per chi non dice lo sport
+  for (let i = 1; i < pts.length; i++) {
+    const dt = (pts[i][2] - pts[i - 1][2]) / 1000;
+    if (dt > 0) pts[i][4] = haversine(pts[i - 1], pts[i]) / dt;
+  }
+  const sport = /cycl|bik|ride|ciclis|bici/.test(type) ? 2 : /hik|escurs/.test(type) ? 17 : /walk|cammin/.test(type) ? 11 : /run|corsa/.test(type) ? 1 : 0;
+  if (sport === 0) {
+    const sp = pts.map((p) => p[4]).filter((x) => x != null).sort((a, b) => a - b);
+    const med = sp.length ? sp[sp.length >> 1] * 3.6 : 0;
+    if (med >= 14 && med <= 45) return { sport: 2, sub: null, pts, maker: null };
+  }
+  return { sport, sub: null, pts, maker: null };
+}
+
 // TCX (vecchi file Garmin): sport e punti
 function parseTcx(text) {
   const doc = new DOMParser().parseFromString(text, 'application/xml');
@@ -1715,15 +1740,19 @@ function loadJSZip() {
 async function importGarmin(files) {
   let read = 0, kept = 0, skipped = 0;
   const notGarmin = {};
+  const report = { bici: {}, piedi: {}, scartate: {}, formati: {} };
+  const note = (group, key) => { report[group][key] = (report[group][key] || 0) + 1; };
   const seen = new Set((await DB.all()).filter((r) => r.source === 'garmin').map((r) => r.name));
   const handle = async (name, getBuf) => {
     read++;
+    note('formati', (/\.(fit|tcx|gpx)/i.exec(name) || ['', '?'])[1].toLowerCase());
     try {
       let buf = await getBuf();
       if (/\.gz$/i.test(name)) buf = await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
-      const r = /\.tcx(\.gz)?$/i.test(name) ? parseTcx(new TextDecoder().decode(buf)) : parseFit(buf);
+      const r = /\.tcx(\.gz)?$/i.test(name) ? parseTcx(new TextDecoder().decode(buf))
+        : /\.gpx(\.gz)?$/i.test(name) ? parseGarminGpx(new TextDecoder().decode(buf), name) : parseFit(buf);
       const kind = r.pts.length >= 10 ? garminKind(r.sport, r.sub, r.pts) : null;
-      if (!kind) { skipped++; return; }
+      if (!kind) { skipped++; note('scartate', r.pts.length < 10 ? 'senza GPS' : FIT_INDOOR.has(r.sub) ? 'indoor/virtuale' : 'altro sport'); return; }
       // Bici registrata da un programma e non da un dispositivo GPS: quasi sempre un'uscita
       // virtuale (es. Rouvy nel 2015, "in Belgio"), anche se all'epoca non era segnata come tale
       const virtual = r.trainer || FIT_VIRTUAL_MAKERS.has(r.maker) || VIRTUAL_APP.test(r.app || '');
@@ -1731,12 +1760,14 @@ async function importGarmin(files) {
       if (kind === 'bicycle' && (virtual || !trusted)) {
         const who = r.trainer && !r.app ? 'rullo collegato' : r.app || FIT_MAKERS[r.maker] || 'codice ' + r.maker;
         notGarmin[who] = (notGarmin[who] || 0) + 1;
+        note('scartate', 'bici ' + who);
         skipped++;
         return;
       }
       const pts = thinTrack(r.pts, kind);
-      if (pts.length < 2 || pts[0][2] === null) { skipped++; return; }
+      if (pts.length < 2 || pts[0][2] === null) { skipped++; note('scartate', 'senza orari'); return; }
       const id = 'garmin-' + pts[0][2];
+      note(kind === 'bicycle' ? 'bici' : 'piedi', new Date(pts[0][2]).getFullYear());
       if (seen.has(id)) return; // già caricata (stessa ora di partenza)
       seen.add(id);
       // Pausa con spostamento (bici caricata in auto e ripartenza altrove) o buco di segnale:
@@ -1749,14 +1780,14 @@ async function importGarmin(files) {
       }
       await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, start: pts[0][2], end: pts[pts.length - 1][2], segments: segments.filter((x) => x.length >= 2) });
       kept++;
-    } catch { skipped++; }
+    } catch { skipped++; note('scartate', 'file illeggibile'); }
     if (read % 25 === 0) setStatus(`Garmin: lette ${read} attività, ${kept} con percorso all'aperto…`, false, true);
   };
   const walkZip = async (zip) => {
     for (const entry of Object.values(zip.files)) {
       if (entry.dir) continue;
       if (/\.zip$/i.test(entry.name)) { await walkZip(await JSZip.loadAsync(await entry.async('uint8array'))); continue; }
-      if (/\.(fit|tcx)(\.gz)?$/i.test(entry.name)) await handle(entry.name, () => entry.async('arraybuffer'));
+      if (/\.(fit|tcx|gpx)(\.gz)?$/i.test(entry.name)) await handle(entry.name, () => entry.async('arraybuffer'));
     }
   };
   try {
@@ -1769,9 +1800,10 @@ async function importGarmin(files) {
     }
     if (kept) store.set('gaDirty', '1');
     await reloadFromDb(true);
-    const apps = Object.entries(notGarmin).map(([k, n]) => `${k} ×${n}`).join(', ');
-    setStatus(`Garmin: ${kept} attività all'aperto aggiunte su ${read} lette (scartate ${skipped}: indoor, virtuali, senza GPS o altri sport)` +
-      (apps ? `. Bici scartate perché virtuali o di provenienza sconosciuta: ${apps}.` : '.'), false, true);
+    const fmt = (o) => Object.entries(o).sort().map(([k, n]) => `${k}: ${n}`).join(', ') || 'nessuna';
+    setStatus(`Garmin: lette ${read} attività (${fmt(report.formati)}), nuove ${kept}. ` +
+      `Bici per anno → ${fmt(report.bici)}. A piedi per anno → ${fmt(report.piedi)}. Scartate → ${fmt(report.scartate)}.`, false, true);
+    $('garminReport').textContent = 'Ultimo caricamento Garmin: ' + $('status').textContent;
     if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
   } catch (err) {
     setStatus('Garmin: ' + err.message, true);
