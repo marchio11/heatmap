@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '41';
+const APP_VERSION = '42';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1152,7 +1152,10 @@ function samplePath(path, step, keep = () => true, fromStart = true) {
 function elevationTargets() {
   const missing = new Map();
   let zoom = TILE_Z_COARSE;
-  const want = (p) => { const k = cellKey(p); if (!(k in elevCache) && !missing.has(k)) missing.set(k, { p, z: zoom }); };
+  const want = (p) => {
+    const k = (zoom === TILE_Z_FINE ? 'f:' : '') + cellKey(p); // le misure fini stanno a parte
+    if (!(k in elevCache) && !missing.has(k)) missing.set(k, { p, z: zoom });
+  };
   const elev = (p) => elevCache[cellKey(p)] ?? -9999;
   for (const seg of allSegments) {
     for (const pc of seg.pieces) {
@@ -1264,7 +1267,20 @@ async function fillElevations() {
           try {
             const [z, x, y] = key.split('/').map(Number);
             const d = await loadTile(z, x, y);
-            const got = pts.map(([k, px, py]) => { elevCache[k] = Math.round(terrarium(d, px, py)); return [k, elevCache[k]]; });
+            const got = pts.map(([k, px, py]) => {
+              let e;
+              if (z === TILE_Z_FINE) {
+                // mediana di 3x3 pixel (~20 m): un pixel sbagliato non conta
+                const v = [];
+                for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+                  v.push(terrarium(d, Math.min(255, Math.max(0, px + dx)), Math.min(255, Math.max(0, py + dy))));
+                }
+                v.sort((a, b) => a - b);
+                e = v[4];
+              } else e = terrarium(d, px, py);
+              elevCache[k] = Math.round(e);
+              return [k, elevCache[k]];
+            });
             await ElevDB.putMany(got);
           } catch { failed++; }
           n++;
@@ -1329,13 +1345,23 @@ const recPoints = { high: null, far: null };
 const emojiIcon = (e) => L.divIcon({ className: 'rec-icon', html: e, iconSize: [30, 30], iconAnchor: [15, 15] });
 const fmtDay = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d) ? new Date(d + 'T12:00:00').toLocaleDateString('it-IT', { day: 'numeric', month: 'long', year: 'numeric' }) : d;
 
+// Quota di un punto per il record: la misura fine se c'è; quella grossolana (pixel ~110 m, sui
+// fianchi dei monti sbaglia anche di 200 m: 2.947 m al Col de la Bonette) solo in pianura e collina
+function elevAt(p) {
+  const k = cellKey(p);
+  const fine = elevCache['f:' + k];
+  if (fine !== undefined) return fine;
+  const coarse = elevCache[k];
+  return coarse !== undefined && coarse < ELEV_HIGH ? coarse : undefined;
+}
+
 function renderRecords() {
   recLayer.clearLayers();
   const home = getHome();
   let high = null, far = null;
   for (const seg of visiblePieces(currentSegments())) {
     for (const p of seg.path) {
-      const e = elevCache[cellKey(p)];
+      const e = elevAt(p);
       if (e !== undefined && e > -9000 && (!high || e > high.e)) high = { e, p, day: seg.day };
     }
     for (const p of seg.path) {
