@@ -1136,9 +1136,9 @@ let elevRetry = null;
 
 // Dove chiedere la quota, a "zoom progressivo" (Open-Meteo gratuito conta ogni posizione:
 // max 600 al minuto, 5.000 all'ora, 10.000 al giorno): lungo i percorsi, che stanno sulle strade,
-// 1) un punto ogni 10 km; 2) sopra gli 800 m, uno ogni km nei 10 km intorno;
-// 3) sui punti più alti sopra i 1.200 m (le cime dei colli), uno ogni 100 m nel km intorno.
-const ELEV_COARSE = 10000, ELEV_MID = 1000, ELEV_FINE = 100, ELEV_HILLS = 800, ELEV_HIGH = 1200;
+// 1) un punto ogni 10 km; 2) sopra i 1.200 m, uno ogni km nei 10 km intorno;
+// 3) sui punti più alti sopra i 1.800 m (le cime dei colli), uno ogni 100 m nel km intorno.
+const ELEV_COARSE = 10000, ELEV_MID = 1000, ELEV_FINE = 100, ELEV_HILLS = 1200, ELEV_HIGH = 1800;
 function samplePath(path, step, keep = () => true, fromStart = true) {
   const out = [];
   let acc = fromStart ? step : 0;
