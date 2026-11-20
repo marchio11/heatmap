@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '38';
+const APP_VERSION = '39';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1134,12 +1134,14 @@ function loadElevations() {
 let elevBusy = false;
 let elevRetry = null;
 
-// Dove chiedere la quota: lungo i percorsi (che stanno sulle strade) un punto ogni km; dove si
-// superano i 1.200 m, un punto ogni 100 m nei 3 km intorno, per prendere la cima dei colli.
-const ELEV_STEP = 1000, ELEV_FINE = 100, ELEV_HIGH = 1200, ELEV_NEAR = 3000;
-function samplePath(path, step, keep = () => true) {
+// Dove chiedere la quota, a "zoom progressivo" (Open-Meteo gratuito conta ogni posizione:
+// max 600 al minuto, 5.000 all'ora, 10.000 al giorno): lungo i percorsi, che stanno sulle strade,
+// 1) un punto ogni 10 km; 2) sopra gli 800 m, uno ogni km nei 10 km intorno;
+// 3) sui punti più alti sopra i 1.200 m (le cime dei colli), uno ogni 100 m nel km intorno.
+const ELEV_COARSE = 10000, ELEV_MID = 1000, ELEV_FINE = 100, ELEV_HILLS = 800, ELEV_HIGH = 1200;
+function samplePath(path, step, keep = () => true, fromStart = true) {
   const out = [];
-  let acc = step;
+  let acc = fromStart ? step : 0;
   for (let i = 0; i < path.length; i++) {
     if (i) acc += haversine(path[i - 1], path[i]);
     if (acc >= step && keep(path[i])) { out.push(path[i]); acc = 0; }
@@ -1149,13 +1151,20 @@ function samplePath(path, step, keep = () => true) {
 function elevationTargets() {
   const missing = new Map();
   const want = (p) => { const k = cellKey(p); if (!(k in elevCache) && !missing.has(k)) missing.set(k, p); };
+  const elev = (p) => elevCache[cellKey(p)] ?? -9999;
   for (const seg of allSegments) {
     for (const pc of seg.pieces) {
-      const coarse = samplePath(pc.path, ELEV_STEP);
+      // niente punto di partenza (quasi sempre casa o lavoro): basta l'arrivo, che conta (es. parcheggi in cima ai colli)
+      const coarse = samplePath(pc.path, ELEV_COARSE, () => true, false);
       coarse.forEach(want);
       want(pc.path[pc.path.length - 1]);
-      const high = coarse.filter((p) => (elevCache[cellKey(p)] ?? -9999) >= ELEV_HIGH);
-      if (high.length) samplePath(pc.path, ELEV_FINE, (p) => high.some((h) => haversine(h, p) <= ELEV_NEAR)).forEach(want);
+      const hills = [...coarse, pc.path[pc.path.length - 1]].filter((p) => elev(p) >= ELEV_HILLS);
+      if (!hills.length) continue;
+      const mid = samplePath(pc.path, ELEV_MID, (p) => hills.some((h) => haversine(h, p) <= ELEV_COARSE));
+      mid.forEach(want);
+      // cime: punti da 1 km più alti dei vicini
+      const peaks = mid.filter((p, i) => elev(p) >= ELEV_HIGH && elev(p) >= elev(mid[i - 1] || p) && elev(p) >= elev(mid[i + 1] || p));
+      if (peaks.length) samplePath(pc.path, ELEV_FINE, (p) => peaks.some((h) => haversine(h, p) <= ELEV_MID)).forEach(want);
     }
   }
   return missing;
@@ -1166,7 +1175,8 @@ async function fillElevations() {
   elevBusy = true;
   try {
     await loadElevations();
-   for (let round = 0; round < 3; round++) {
+   let doneLocs = 0;
+   for (let round = 0; round < 4; round++) {
     const list = [...elevationTargets().entries()];
     if (!list.length) break;
     for (let i = 0; i < list.length; i += 100) {
@@ -1185,18 +1195,21 @@ async function fillElevations() {
         got.push([k, elevCache[k]]);
       });
       await ElevDB.putMany(got);
-      if (list.length > 300) setStatus(`Calcolo le quote… ${Math.min(i + 100, list.length)}/${list.length}`);
+      doneLocs += batch.length;
+      if (list.length > 300) setStatus(`Calcolo le quote… ${doneLocs} fatte, ${list.length - i - batch.length} ancora in questo giro`);
       if ((i / 100) % 10 === 9) renderRecords(); // il record si aggiorna strada facendo
-      // Open-Meteo gratuito: max 600 "chiamate" al minuto, e 100 luoghi contano come 10 chiamate
-      await sleep(1100);
+      // Open-Meteo gratuito: ogni posizione conta come una chiamata, max 600 al minuto
+      await sleep(11000);
     }
     renderRecords();
     if (list.length > 300) setStatus('Quote calcolate: punto più alto aggiornato.');
    }
   } catch {
-    // limite del servizio o pagina sospesa: riprovo tra un minuto (quello già fatto è salvato)
+    // limite del servizio (orario o giornaliero) o pagina sospesa: riprovo tra 10 minuti
+    // (quello già fatto è salvato)
+    setStatus('Quote: limite del servizio gratuito raggiunto, riprendo da solo tra 10 minuti.');
     clearTimeout(elevRetry);
-    elevRetry = setTimeout(fillElevations, 60_000);
+    elevRetry = setTimeout(fillElevations, 10 * 60_000);
   } finally {
     keepAwake(false, 'elev');
     elevBusy = false;
