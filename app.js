@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '43';
+const APP_VERSION = '44';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1705,7 +1705,15 @@ async function importGarmin(files) {
       const id = 'garmin-' + pts[0][2];
       if (seen.has(id)) return; // già caricata (stessa ora di partenza)
       seen.add(id);
-      await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, start: pts[0][2], end: pts[pts.length - 1][2], segments: [pts] });
+      // Pausa con spostamento (bici caricata in auto e ripartenza altrove) o buco di segnale:
+      // oltre 2 minuti e 500 m tra due punti la traccia si interrompe invece di tirare una riga dritta
+      const segments = [[pts[0]]];
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i];
+        if (a[2] !== null && b[2] !== null && b[2] - a[2] > 120000 && haversine(a, b) > 500) segments.push([]);
+        segments[segments.length - 1].push(b);
+      }
+      await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, start: pts[0][2], end: pts[pts.length - 1][2], segments: segments.filter((x) => x.length >= 2) });
       kept++;
     } catch { skipped++; }
     if (read % 25 === 0) setStatus(`Garmin: lette ${read} attività, ${kept} con percorso all'aperto…`, false, true);
