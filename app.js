@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '51';
+const APP_VERSION = '53';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1784,6 +1784,42 @@ function parseTcx(text) {
   return { sport: sp === 'biking' ? 2 : sp === 'running' ? 1 : 0, sub: null, pts };
 }
 
+// Strava: activities.csv dice il tipo di ogni attività (anche in italiano) e il nome del file
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; } else field += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); rows.push(row); row = []; field = '';
+    } else field += c;
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+function stravaTypes(text) {
+  const rows = parseCsv(text.replace(/^\uFEFF/, ''));
+  const head = rows[0] || [];
+  const ti = head.findIndex((h) => /^(tipo attivit|activity type)/i.test(h));
+  const fi = head.findIndex((h) => /^(nome del file|filename)/i.test(h));
+  const map = new Map();
+  if (ti < 0 || fi < 0) return map;
+  for (const r of rows.slice(1)) if (r[fi]) map.set(r[fi].split('/').pop(), r[ti]);
+  return map;
+}
+// tipo Strava → categoria: virtuali scartate, poi bici, poi a piedi
+function stravaKind(type) {
+  if (/virtual|virtuale/i.test(type)) return 'virtuale';
+  if (/ciclism|ride|bici|bike|pedalat|mountain|gravel|velo/i.test(type)) return 'bicycle';
+  if (/cors|run|escursion|hike|cammin|walk|trail|trekking|alpinism/i.test(type)) return 'walking';
+  return null;
+}
+
 let jszipLoading = null;
 function loadJSZip() {
   if (window.JSZip) return Promise.resolve();
@@ -1801,16 +1837,34 @@ async function importGarmin(files) {
   const notGarmin = {};
   const report = { bici: {}, piedi: {}, scartate: {}, formati: {} };
   const note = (group, key) => { report[group][key] = (report[group][key] || 0) + 1; };
-  const seen = new Set((await DB.all()).filter((r) => r.source === 'garmin').map((r) => r.name));
+  const existing = (await DB.all()).filter((r) => r.source === 'garmin');
+  const seen = new Set(existing.map((r) => r.name));
+  // stessa attività da Garmin e da Strava (orari che differiscono di qualche secondo): si riconosce
+  // perché si sovrappone nel tempo per più di metà a una già presente
+  const spans = existing.map((r) => [r.start, r.end]);
+  const overlaps = (a, b) => spans.some(([s0, s1]) => {
+    const o = Math.min(b, s1) - Math.max(a, s0);
+    return o > 0 && o > 0.5 * Math.min(b - a, s1 - s0);
+  });
+  let csvTypes = new Map();
   const handle = async (name, getBuf) => {
     read++;
+    const csvType = csvTypes.get(name.split('/').pop());
+    if (csvType !== undefined && stravaKind(csvType) !== 'bicycle' && stravaKind(csvType) !== 'walking') {
+      skipped++; note('scartate', 'Strava: ' + (stravaKind(csvType) === 'virtuale' ? 'pedalata virtuale' : csvType)); return;
+    }
     note('formati', (/\.(fit|tcx|gpx)/i.exec(name) || ['', '?'])[1].toLowerCase());
     try {
       let buf = await getBuf();
       if (/\.gz$/i.test(name)) buf = await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
       const r = /\.tcx(\.gz)?$/i.test(name) ? parseTcx(new TextDecoder().decode(buf))
         : /\.gpx(\.gz)?$/i.test(name) ? parseGarminGpx(new TextDecoder().decode(buf), name) : parseFit(buf);
-      const kind = r.pts.length >= 10 ? garminKind(r.sport, r.sub, r.pts) : null;
+      let kind = r.pts.length >= 10 ? garminKind(r.sport, r.sub, r.pts) : null;
+      if (csvType !== undefined && r.pts.length >= 10 && !r.trainer) {
+        // il tipo deciso su Strava vale più di quello indovinato dal file; la bici a passo d'uomo resta un'escursione
+        kind = stravaKind(csvType);
+        if (kind === 'bicycle') { const v = typicalKmh(r.pts, 4); if (v !== null && v < BIKE_MIN_KMH) kind = 'walking'; }
+      }
       if (!kind) {
         skipped++;
         if (r.pts.length < 10 && r.sport === 2 && !FIT_INDOOR.has(r.sub)) {
@@ -1823,7 +1877,7 @@ async function importGarmin(files) {
       // virtuale (es. Rouvy nel 2015, "in Belgio"), anche se all'epoca non era segnata come tale
       const virtual = r.trainer || FIT_VIRTUAL_MAKERS.has(r.maker) || VIRTUAL_APP.test(r.app || '');
       const trusted = r.maker === null || FIT_DEVICES.has(r.maker) || isTapSync(r, name);
-      if (kind === 'bicycle' && (virtual || !trusted)) {
+      if (kind === 'bicycle' && csvType === undefined && (virtual || !trusted)) {
         const who = r.trainer && !r.app ? 'rullo collegato' : r.app || FIT_MAKERS[r.maker] || 'codice ' + r.maker;
         notGarmin[who] = (notGarmin[who] || 0) + 1;
         note('scartate', 'bici ' + who);
@@ -1834,8 +1888,10 @@ async function importGarmin(files) {
       if (pts.length < 2 || pts[0][2] === null) { skipped++; note('scartate', 'senza orari'); return; }
       const id = 'garmin-' + pts[0][2];
       note(kind === 'bicycle' ? 'bici' : 'piedi', new Date(pts[0][2]).getFullYear());
-      if (seen.has(id)) return; // già caricata (stessa ora di partenza)
+      const t1 = pts[pts.length - 1][2];
+      if (seen.has(id) || overlaps(pts[0][2], t1)) { note('scartate', 'già presenti'); return; } // doppione
       seen.add(id);
+      spans.push([pts[0][2], t1]);
       // Pausa con spostamento (bici caricata in auto e ripartenza altrove) o buco di segnale:
       // oltre 2 minuti e 500 m tra due punti la traccia si interrompe invece di tirare una riga dritta
       const segments = [[pts[0]]];
@@ -1850,6 +1906,8 @@ async function importGarmin(files) {
     if (read % 25 === 0) setStatus(`Garmin: lette ${read} attività, ${kept} con percorso all'aperto…`, false, true);
   };
   const walkZip = async (zip) => {
+    const csv = Object.values(zip.files).find((e) => /(^|\/)activities\.csv$/i.test(e.name));
+    if (csv) csvTypes = stravaTypes(await csv.async('string'));
     for (const entry of Object.values(zip.files)) {
       if (entry.dir) continue;
       if (/\.zip$/i.test(entry.name)) { await walkZip(await JSZip.loadAsync(await entry.async('uint8array'))); continue; }
@@ -1867,7 +1925,7 @@ async function importGarmin(files) {
     if (kept) store.set('gaDirty', '1');
     await reloadFromDb(true);
     const fmt = (o) => Object.entries(o).sort().map(([k, n]) => `${k}: ${n}`).join(', ') || 'nessuna';
-    setStatus(`Garmin: lette ${read} attività (${fmt(report.formati)}), nuove ${kept}. ` +
+    setStatus(`${csvTypes.size ? 'Strava' : 'Garmin'}: lette ${read} attività (${fmt(report.formati)}), nuove ${kept}. ` +
       `Bici per anno → ${fmt(report.bici)}. A piedi per anno → ${fmt(report.piedi)}. Scartate → ${fmt(report.scartate)}.`, false, true);
     $('garminReport').textContent = 'Ultimo caricamento Garmin: ' + $('status').textContent;
     if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
