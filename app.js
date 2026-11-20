@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '40';
+const APP_VERSION = '41';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1133,6 +1133,7 @@ function loadElevations() {
 }
 let elevBusy = false;
 let elevRetry = null;
+let tilesBroken = false; // tessere non scaricabili: si usano i servizi di quote
 
 // Dove chiedere la quota, a "zoom progressivo" (Open-Meteo gratuito conta ogni posizione:
 // max 600 al minuto, 5.000 all'ora, 10.000 al giorno): lungo i percorsi, che stanno sulle strade,
@@ -1150,7 +1151,8 @@ function samplePath(path, step, keep = () => true, fromStart = true) {
 }
 function elevationTargets() {
   const missing = new Map();
-  const want = (p) => { const k = cellKey(p); if (!(k in elevCache) && !missing.has(k)) missing.set(k, p); };
+  let zoom = TILE_Z_COARSE;
+  const want = (p) => { const k = cellKey(p); if (!(k in elevCache) && !missing.has(k)) missing.set(k, { p, z: zoom }); };
   const elev = (p) => elevCache[cellKey(p)] ?? -9999;
   for (const seg of allSegments) {
     for (const pc of seg.pieces) {
@@ -1164,13 +1166,37 @@ function elevationTargets() {
       mid.forEach(want);
       // cime: punti da 1 km più alti dei vicini
       const peaks = mid.filter((p, i) => elev(p) >= ELEV_HIGH && elev(p) >= elev(mid[i - 1] || p) && elev(p) >= elev(mid[i + 1] || p));
+      zoom = TILE_Z_FINE;
       if (peaks.length) samplePath(pc.path, ELEV_FINE, (p) => peaks.some((h) => haversine(h, p) <= ELEV_MID)).forEach(want);
+      zoom = TILE_Z_COARSE;
     }
   }
   return missing;
 }
 
-// Due servizi gratuiti, si passa all'altro se uno è al limite o non risponde:
+// Quote calcolate dalle "tessere del terreno" pubbliche di AWS (Terrarium): immagini in cui il
+// colore di ogni pixel è l'altitudine, gratuite, senza limiti di richieste e leggibili dal browser.
+// Zoom 10 (pixel ~110 m) per la ricerca, 14 (pixel ~7 m) intorno alle cime.
+const TILE_Z_COARSE = 10, TILE_Z_FINE = 14;
+const TILE_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/';
+function tileOf(p, z) {
+  const n = 2 ** z, lat = p[0] * Math.PI / 180;
+  const fx = (p[1] + 180) / 360 * n;
+  const fy = (1 - Math.log(Math.tan(lat) + 1 / Math.cos(lat)) / Math.PI) / 2 * n;
+  return { x: Math.floor(fx), y: Math.floor(fy), px: Math.min(255, Math.floor((fx % 1) * 256)), py: Math.min(255, Math.floor((fy % 1) * 256)) };
+}
+async function loadTile(z, x, y) {
+  const res = await fetch(`${TILE_URL}${z}/${x}/${y}.png`);
+  if (!res.ok) throw new Error('tessera ' + res.status);
+  const bmp = await createImageBitmap(await res.blob());
+  const cv = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(256, 256) : Object.assign(document.createElement('canvas'), { width: 256, height: 256 });
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0);
+  return ctx.getImageData(0, 0, 256, 256).data;
+}
+const terrarium = (d, px, py) => { const i = (py * 256 + px) * 4; return d[i] * 256 + d[i + 1] + d[i + 2] / 256 - 32768; };
+
+// Riserva se le tessere non si potessero scaricare. Due servizi gratuiti, si passa all'altro se uno è al limite:
 // - Open Topo Data (EU-DEM 25 m in Europa, SRTM 30 m altrove): 100 posizioni = 1 richiesta,
 //   max 1 al secondo e 1.000 al giorno (100.000 posizioni);
 // - Open-Meteo (Copernicus 90 m): ogni posizione conta, max 600 al minuto e 10.000 al giorno.
@@ -1219,8 +1245,38 @@ async function fillElevations() {
     await loadElevations();
    let doneLocs = 0;
    for (let round = 0; round < 4; round++) {
-    const list = [...elevationTargets().entries()];
-    if (!list.length) break;
+    const targets = [...elevationTargets().entries()];
+    if (!targets.length) break;
+    if (!tilesBroken) {
+      // raggruppa per tessera: si scarica una volta e si leggono tutti i punti che ci cadono
+      const byTile = new Map();
+      for (const [k, { p, z }] of targets) {
+        const t = tileOf(p, z), key = `${z}/${t.x}/${t.y}`;
+        if (!byTile.has(key)) byTile.set(key, []);
+        byTile.get(key).push([k, t.px, t.py]);
+      }
+      const tiles = [...byTile.entries()];
+      let n = 0, failed = 0;
+      if (tiles.length > 5) keepAwake(true, 'elev');
+      const worker = async () => {
+        while (tiles.length) {
+          const [key, pts] = tiles.shift();
+          try {
+            const [z, x, y] = key.split('/').map(Number);
+            const d = await loadTile(z, x, y);
+            const got = pts.map(([k, px, py]) => { elevCache[k] = Math.round(terrarium(d, px, py)); return [k, elevCache[k]]; });
+            await ElevDB.putMany(got);
+          } catch { failed++; }
+          n++;
+          doneLocs += pts.length;
+          if (byTile.size > 5) setStatus(`Calcolo le quote… ${n}/${byTile.size} zone della mappa`);
+          if (n % 20 === 0) renderRecords();
+        }
+      };
+      await Promise.all([worker(), worker(), worker()]);
+      if (failed && failed === byTile.size) { tilesBroken = true; } else { renderRecords(); continue; }
+    }
+    const list = targets.map(([k, t]) => [k, t.p]);
     for (let i = 0; i < list.length; i += 100) {
       const batch = list.slice(i, i + 100);
       if (i === 0 && list.length > 300) keepAwake(true, 'elev');
@@ -1238,8 +1294,8 @@ async function fillElevations() {
       await sleep(wait);
     }
     renderRecords();
-    if (list.length > 300) setStatus('Quote calcolate: punto più alto aggiornato.');
    }
+    if (doneLocs > 300) setStatus('Quote calcolate: punto più alto aggiornato.');
   } catch {
     // limite del servizio (orario o giornaliero) o pagina sospesa: riprovo tra 10 minuti
     // (quello già fatto è salvato)
