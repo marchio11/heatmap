@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '54';
+const APP_VERSION = '55';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -656,7 +656,8 @@ function splitByMode(pts, modes, runs, day, timeline = false, garmin = false) {
 
 // Filtro della mappa: a piedi / in veicolo (all'apertura sempre entrambi)
 const show = { w: false, v: true, t: true, b: false }; // all'apertura: solo veicoli
-const visiblePieces = (segs) => segs.flatMap((s) => s.timeline && !show.t ? [] : s.pieces.filter((p) => show[p.m]));
+// la Cronologia ha la sua casella: non dipende da "Veicoli" (anche se sono viaggi in auto)
+const visiblePieces = (segs) => segs.flatMap((s) => s.timeline ? (show.t ? s.pieces : []) : s.pieces.filter((p) => show[p.m]));
 
 // Cronologia Google: solo i viaggi in auto, uno per "segmento", raggruppati per giorno
 const TL_PREFIX = 'cronologia-';
