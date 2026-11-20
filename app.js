@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '45';
+const APP_VERSION = '46';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1644,8 +1644,11 @@ function parseFit(buf) {
   return { sport, sub, pts, maker, app };
 }
 
-// Programmi di allenamento virtuale (codici produttore FIT): i loro percorsi sono finti
-const FIT_MAKERS = { 89: 'Tacx', 67: 'Bkool', 260: 'Zwift', 265: 'Strava', 284: 'Rouvy', 281: 'TrainerRoad', 32: 'Wahoo', 255: 'app sconosciuta' };
+// Chi ha registrato il file (codici produttore FIT). Dispositivi GPS veri: le uscite valgono.
+// Wahoo ELEMNT/BOLT usato per anni al posto dell'Edge (20/11).
+const FIT_DEVICES = new Set([1, 32, 23, 70, 123, 267, 289, 294]); // Garmin, Wahoo, Suunto, Sigma, Polar, Bryton, Hammerhead, Coros
+const FIT_MAKERS = { 89: 'Tacx', 67: 'Bkool', 260: 'Zwift', 265: 'Strava', 284: 'Rouvy', 281: 'TrainerRoad', 255: 'app sconosciuta' };
+const VIRTUAL_APP = /rouvy|zwift|tacx|bkool|kinomap|fulgaz|rgt|trainerroad|mywhoosh|systm|sufferfest|virtual|indoor/i;
 
 // Sport Garmin → categoria della heatmap
 function garminKind(sport, sub, pts) {
@@ -1714,9 +1717,9 @@ async function importGarmin(files) {
       const r = /\.tcx(\.gz)?$/i.test(name) ? parseTcx(new TextDecoder().decode(buf)) : parseFit(buf);
       const kind = r.pts.length >= 10 ? garminKind(r.sport, r.sub, r.pts) : null;
       if (!kind) { skipped++; return; }
-      // Bici registrata da un programma e non da un dispositivo Garmin: quasi sempre un'uscita
+      // Bici registrata da un programma e non da un dispositivo GPS: quasi sempre un'uscita
       // virtuale (es. Rouvy nel 2015, "in Belgio"), anche se all'epoca non era segnata come tale
-      if (kind === 'bicycle' && r.maker !== null && r.maker !== 1) {
+      if (kind === 'bicycle' && r.maker !== null && (!FIT_DEVICES.has(r.maker) || VIRTUAL_APP.test(r.app || ''))) {
         const who = r.app || FIT_MAKERS[r.maker] || 'codice ' + r.maker;
         notGarmin[who] = (notGarmin[who] || 0) + 1;
         skipped++;
@@ -1759,7 +1762,7 @@ async function importGarmin(files) {
     await reloadFromDb(true);
     const apps = Object.entries(notGarmin).map(([k, n]) => `${k} ×${n}`).join(', ');
     setStatus(`Garmin: ${kept} attività all'aperto aggiunte su ${read} lette (scartate ${skipped}: indoor, virtuali, senza GPS o altri sport)` +
-      (apps ? `. Bici non registrate da un Garmin, scartate: ${apps}.` : '.'), false, true);
+      (apps ? `. Bici create da app di allenamento virtuale, scartate: ${apps}.` : '.'), false, true);
     if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
   } catch (err) {
     setStatus('Garmin: ' + err.message, true);
