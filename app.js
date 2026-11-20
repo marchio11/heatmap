@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '46';
+const APP_VERSION = '47';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1593,7 +1593,7 @@ function parseFit(buf) {
   const end = Math.min(buf.byteLength, hs + dv.getUint32(4, true));
   const defs = {};
   const pts = [];
-  let sport = null, sub = null, maker = null, app = null, lastTs = 0, i = hs;
+  let sport = null, sub = null, maker = null, product = null, app = null, trainer = false, lastTs = 0, i = hs;
   const read = (off, size, le) => size === 1 ? u8[off] : size === 2 ? dv.getUint16(off, le) : size === 4 ? dv.getUint32(off, le) : null;
   while (i < end) {
     const h = u8[i++];
@@ -1634,20 +1634,27 @@ function parseFit(buf) {
       pts.push([lat * 180 / 2 ** 31, lon * 180 / 2 ** 31, ts !== null ? (ts + 631065600) * 1000 : null, alt, spd]);
     } else if (def.gm === 0) { // file_id: chi ha registrato il file
       if (v[1] != null && v[1] !== 0xFFFF) maker = v[1];
+      if (v[2] != null && v[2] !== 0xFFFF) product = v[2];
       if (typeof v[8] === 'string' && v[8]) app = v[8];
+    } else if (def.gm === 23) { // device_info: sensori collegati
+      if (v[1] === 17) trainer = true; // "attrezzatura fitness": un rullo (Tacx, KICKR…), quindi uscita indoor
     } else if (def.gm === 18 || def.gm === 12) { // session / sport
       const sp = def.gm === 18 ? v[5] : v[0], sb = def.gm === 18 ? v[6] : v[1];
       if (sp != null && sp !== 0xFF) sport = sp;
       if (sb != null && sb !== 0xFF) sub = sb;
     }
   }
-  return { sport, sub, pts, maker, app };
+  return { sport, sub, pts, maker, product, app, trainer };
 }
 
 // Chi ha registrato il file (codici produttore FIT). Dispositivi GPS veri: le uscite valgono.
 // Wahoo ELEMNT/BOLT usato per anni al posto dell'Edge (20/11).
 const FIT_DEVICES = new Set([1, 32, 23, 70, 123, 267, 289, 294]); // Garmin, Wahoo, Suunto, Sigma, Polar, Bryton, Hammerhead, Coros
 const FIT_MAKERS = { 89: 'Tacx', 67: 'Bkool', 260: 'Zwift', 265: 'Strava', 284: 'Rouvy', 281: 'TrainerRoad', 255: 'app sconosciuta' };
+const FIT_VIRTUAL_MAKERS = new Set([89, 67, 260, 284, 281]);
+// File copiati da tapiriik ("tap-sync"): le uscite all'aperto del Wahoo, che non si sincronizzava
+// con Garmin Connect. Il servizio riscrive il file come produttore 255, prodotto 15706.
+const isTapSync = (r, name) => (r.maker === 255 && r.product === 15706) || /tap-sync/i.test(name);
 const VIRTUAL_APP = /rouvy|zwift|tacx|bkool|kinomap|fulgaz|rgt|trainerroad|mywhoosh|systm|sufferfest|virtual|indoor/i;
 
 // Sport Garmin → categoria della heatmap
@@ -1719,8 +1726,10 @@ async function importGarmin(files) {
       if (!kind) { skipped++; return; }
       // Bici registrata da un programma e non da un dispositivo GPS: quasi sempre un'uscita
       // virtuale (es. Rouvy nel 2015, "in Belgio"), anche se all'epoca non era segnata come tale
-      if (kind === 'bicycle' && r.maker !== null && (!FIT_DEVICES.has(r.maker) || VIRTUAL_APP.test(r.app || ''))) {
-        const who = r.app || FIT_MAKERS[r.maker] || 'codice ' + r.maker;
+      const virtual = r.trainer || FIT_VIRTUAL_MAKERS.has(r.maker) || VIRTUAL_APP.test(r.app || '');
+      const trusted = r.maker === null || FIT_DEVICES.has(r.maker) || isTapSync(r, name);
+      if (kind === 'bicycle' && (virtual || !trusted)) {
+        const who = r.trainer && !r.app ? 'rullo collegato' : r.app || FIT_MAKERS[r.maker] || 'codice ' + r.maker;
         notGarmin[who] = (notGarmin[who] || 0) + 1;
         skipped++;
         return;
@@ -1762,7 +1771,7 @@ async function importGarmin(files) {
     await reloadFromDb(true);
     const apps = Object.entries(notGarmin).map(([k, n]) => `${k} ×${n}`).join(', ');
     setStatus(`Garmin: ${kept} attività all'aperto aggiunte su ${read} lette (scartate ${skipped}: indoor, virtuali, senza GPS o altri sport)` +
-      (apps ? `. Bici create da app di allenamento virtuale, scartate: ${apps}.` : '.'), false, true);
+      (apps ? `. Bici scartate perché virtuali o di provenienza sconosciuta: ${apps}.` : '.'), false, true);
     if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
   } catch (err) {
     setStatus('Garmin: ' + err.message, true);
