@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '44';
+const APP_VERSION = '45';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1593,7 +1593,7 @@ function parseFit(buf) {
   const end = Math.min(buf.byteLength, hs + dv.getUint32(4, true));
   const defs = {};
   const pts = [];
-  let sport = null, sub = null, lastTs = 0, i = hs;
+  let sport = null, sub = null, maker = null, app = null, lastTs = 0, i = hs;
   const read = (off, size, le) => size === 1 ? u8[off] : size === 2 ? dv.getUint16(off, le) : size === 4 ? dv.getUint32(off, le) : null;
   while (i < end) {
     const h = u8[i++];
@@ -1606,7 +1606,7 @@ function parseFit(buf) {
       const le = u8[i + 1] === 0, gm = le ? dv.getUint16(i + 2, true) : dv.getUint16(i + 2, false), n = u8[i + 4];
       i += 5;
       const fields = [];
-      for (let k = 0; k < n; k++) fields.push([u8[i + 3 * k], u8[i + 3 * k + 1]]);
+      for (let k = 0; k < n; k++) fields.push([u8[i + 3 * k], u8[i + 3 * k + 1], u8[i + 3 * k + 2] & 0x1f]);
       i += 3 * n;
       let devSize = 0;
       if (h & 0x20) { const nd = u8[i++]; for (let k = 0; k < nd; k++) devSize += u8[i + 3 * k + 1]; i += 3 * nd; }
@@ -1615,7 +1615,14 @@ function parseFit(buf) {
     } else def = defs[h & 0xf];
     if (!def) throw new Error('FIT non valido');
     const v = {};
-    for (const [num, size] of def.fields) { v[num] = read(i, size, def.le); i += size; }
+    for (const [num, size, bt] of def.fields) {
+      if (bt === 7 && def.gm === 0) { // testo (nome del programma che ha creato il file)
+        let t = '';
+        for (let k = 0; k < size && u8[i + k]; k++) t += String.fromCharCode(u8[i + k]);
+        v[num] = t;
+      } else v[num] = read(i, size, def.le);
+      i += size;
+    }
     i += def.devSize;
     if (v[253] != null && v[253] !== 0xFFFFFFFF) ts = v[253];
     if (ts !== null) lastTs = ts;
@@ -1625,14 +1632,20 @@ function parseFit(buf) {
       let alt = v[78] != null && v[78] !== 0xFFFFFFFF ? v[78] / 5 - 500 : v[2] != null && v[2] !== 0xFFFF ? v[2] / 5 - 500 : null;
       const spd = v[73] != null && v[73] !== 0xFFFFFFFF ? v[73] / 1000 : v[6] != null && v[6] !== 0xFFFF ? v[6] / 1000 : null;
       pts.push([lat * 180 / 2 ** 31, lon * 180 / 2 ** 31, ts !== null ? (ts + 631065600) * 1000 : null, alt, spd]);
+    } else if (def.gm === 0) { // file_id: chi ha registrato il file
+      if (v[1] != null && v[1] !== 0xFFFF) maker = v[1];
+      if (typeof v[8] === 'string' && v[8]) app = v[8];
     } else if (def.gm === 18 || def.gm === 12) { // session / sport
       const sp = def.gm === 18 ? v[5] : v[0], sb = def.gm === 18 ? v[6] : v[1];
       if (sp != null && sp !== 0xFF) sport = sp;
       if (sb != null && sb !== 0xFF) sub = sb;
     }
   }
-  return { sport, sub, pts };
+  return { sport, sub, pts, maker, app };
 }
+
+// Programmi di allenamento virtuale (codici produttore FIT): i loro percorsi sono finti
+const FIT_MAKERS = { 89: 'Tacx', 67: 'Bkool', 260: 'Zwift', 265: 'Strava', 284: 'Rouvy', 281: 'TrainerRoad', 32: 'Wahoo', 255: 'app sconosciuta' };
 
 // Sport Garmin → categoria della heatmap
 function garminKind(sport, sub, pts) {
@@ -1691,6 +1704,7 @@ function loadJSZip() {
 
 async function importGarmin(files) {
   let read = 0, kept = 0, skipped = 0;
+  const notGarmin = {};
   const seen = new Set((await DB.all()).filter((r) => r.source === 'garmin').map((r) => r.name));
   const handle = async (name, getBuf) => {
     read++;
@@ -1700,6 +1714,14 @@ async function importGarmin(files) {
       const r = /\.tcx(\.gz)?$/i.test(name) ? parseTcx(new TextDecoder().decode(buf)) : parseFit(buf);
       const kind = r.pts.length >= 10 ? garminKind(r.sport, r.sub, r.pts) : null;
       if (!kind) { skipped++; return; }
+      // Bici registrata da un programma e non da un dispositivo Garmin: quasi sempre un'uscita
+      // virtuale (es. Rouvy nel 2015, "in Belgio"), anche se all'epoca non era segnata come tale
+      if (kind === 'bicycle' && r.maker !== null && r.maker !== 1) {
+        const who = r.app || FIT_MAKERS[r.maker] || 'codice ' + r.maker;
+        notGarmin[who] = (notGarmin[who] || 0) + 1;
+        skipped++;
+        return;
+      }
       const pts = thinTrack(r.pts, kind);
       if (pts.length < 2 || pts[0][2] === null) { skipped++; return; }
       const id = 'garmin-' + pts[0][2];
@@ -1735,7 +1757,9 @@ async function importGarmin(files) {
     }
     if (kept) store.set('gaDirty', '1');
     await reloadFromDb(true);
-    setStatus(`Garmin: ${kept} attività all'aperto aggiunte su ${read} lette (scartate ${skipped}: indoor, virtuali, senza GPS o altri sport).`, false, true);
+    const apps = Object.entries(notGarmin).map(([k, n]) => `${k} ×${n}`).join(', ');
+    setStatus(`Garmin: ${kept} attività all'aperto aggiunte su ${read} lette (scartate ${skipped}: indoor, virtuali, senza GPS o altri sport)` +
+      (apps ? `. Bici non registrate da un Garmin, scartate: ${apps}.` : '.'), false, true);
     if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
   } catch (err) {
     setStatus('Garmin: ' + err.message, true);
