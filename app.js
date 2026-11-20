@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '53';
+const APP_VERSION = '54';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1832,12 +1832,13 @@ function loadJSZip() {
   return jszipLoading;
 }
 
-async function importGarmin(files) {
-  let read = 0, kept = 0, skipped = 0;
+// collect: se è un array, le attività non vengono salvate ma raccolte lì (per l'esportazione)
+async function importGarmin(files, collect = null) {
+  let read = 0, kept = 0, skipped = 0, noGps = 0;
   const notGarmin = {};
   const report = { bici: {}, piedi: {}, scartate: {}, formati: {} };
   const note = (group, key) => { report[group][key] = (report[group][key] || 0) + 1; };
-  const existing = (await DB.all()).filter((r) => r.source === 'garmin');
+  const existing = collect ? [] : (await DB.all()).filter((r) => r.source === 'garmin');
   const seen = new Set(existing.map((r) => r.name));
   // stessa attività da Garmin e da Strava (orari che differiscono di qualche secondo): si riconosce
   // perché si sovrappone nel tempo per più di metà a una già presente
@@ -1867,6 +1868,7 @@ async function importGarmin(files) {
       }
       if (!kind) {
         skipped++;
+        if (r.pts.length < 10) noGps++;
         if (r.pts.length < 10 && r.sport === 2 && !FIT_INDOOR.has(r.sub)) {
           // bici senza posizioni lette: da capire (rulli non dichiarati o file che non leggo bene)
           note('scartate', `bici senza GPS ${r.created ? new Date(r.created).getFullYear() : '?'}${r.records ? '' : ' (0 punti)'}`);
@@ -1900,7 +1902,8 @@ async function importGarmin(files) {
         if (a[2] !== null && b[2] !== null && b[2] - a[2] > 120000 && haversine(a, b) > 500) segments.push([]);
         segments[segments.length - 1].push(b);
       }
-      await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, sport: r.sport, start: pts[0][2], end: pts[pts.length - 1][2], segments: segments.filter((x) => x.length >= 2) });
+      if (collect) collect.push({ start: pts[0][2], kind, type: csvType, pts });
+      else await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, sport: r.sport, start: pts[0][2], end: pts[pts.length - 1][2], segments: segments.filter((x) => x.length >= 2) });
       kept++;
     } catch { skipped++; note('scartate', 'file illeggibile'); }
     if (read % 25 === 0) setStatus(`Garmin: lette ${read} attività, ${kept} con percorso all'aperto…`, false, true);
@@ -1922,6 +1925,7 @@ async function importGarmin(files) {
         await walkZip(await JSZip.loadAsync(f));
       } else await handle(f.name, () => f.arrayBuffer());
     }
+    if (collect) return { read, kept, noGps, report, strava: csvTypes.size > 0 };
     if (kept) store.set('gaDirty', '1');
     await reloadFromDb(true);
     const fmt = (o) => Object.entries(o).sort().map(([k, n]) => `${k}: ${n}`).join(', ') || 'nessuna';
@@ -1930,9 +1934,63 @@ async function importGarmin(files) {
     $('garminReport').textContent = 'Ultimo caricamento Garmin: ' + $('status').textContent;
     if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
   } catch (err) {
+    if (collect) throw err;
     setStatus('Garmin: ' + err.message, true);
   }
 }
+
+/* ---------------- Esportazione delle attività Strava (per trovare i comuni attraversati) ---------------- */
+
+// Rilegge lo ZIP di Strava con le stesse regole dell'importazione e scarica un JSON leggero:
+// [{ date: 'AAAA-MM-GG' (ora italiana), type: 'bici' | 'piedi', points: [[lat, lon], …] }]
+// con un punto ogni ~150 m misurati sul percorso, primo e ultimo sempre presenti.
+const romeDay = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit' });
+function every150m(pts) {
+  const out = [pts[0]];
+  let acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    acc += haversine(pts[i - 1], pts[i]);
+    if (acc >= 150) { out.push(pts[i]); acc = 0; }
+  }
+  if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+  return out.map((p) => [Math.round(p[0] * 1e5) / 1e5, Math.round(p[1] * 1e5) / 1e5]);
+}
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+async function exportStrava(file) {
+  try {
+    setStatus('Esportazione: rileggo lo ZIP di Strava…', false, true);
+    await loadJSZip();
+    const acts = [];
+    const res = await importGarmin([file], acts);
+    if (!res.strava) throw new Error('nello ZIP non c\'è activities.csv: serve l\'archivio completo di Strava');
+    acts.sort((a, b) => a.start - b.start);
+    const out = acts
+      .map((a) => ({ date: romeDay.format(new Date(a.start)), type: a.kind === 'bicycle' ? 'bici' : a.kind === 'walking' ? 'piedi' : (a.type || a.kind), points: every150m(a.pts.filter((p) => isFinite(p[0]) && isFinite(p[1]))) }))
+      .filter((a) => a.points.length >= 2);
+    const json = JSON.stringify(out);
+    let blob = new Blob([json], { type: 'application/json' }), name = 'attivita-strava.json';
+    if (blob.size > 30 * 1048576) {
+      const zip = new JSZip();
+      zip.file(name, json);
+      blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      name = 'attivita-strava.zip';
+    }
+    download(blob, name);
+    const msg = `Esportate ${out.length} attività Strava (dal ${out[0]?.date} al ${out[out.length - 1]?.date}), ` +
+      `file ${name} di ${(blob.size / 1048576).toFixed(1)} MB. Scartate perché senza GPS: ${res.noGps}.`;
+    setStatus(msg, false, true);
+    $('garminReport').textContent = msg;
+  } catch (err) {
+    setStatus('Esportazione non riuscita: ' + err.message, true);
+  }
+}
+$('exportInput').addEventListener('change', (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) exportStrava(f); });
 
 async function removeGarmin() {
   for (const r of await DB.all()) if (r.source === 'garmin') await DB.del(r.name);
