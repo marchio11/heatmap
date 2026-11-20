@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '49';
+const APP_VERSION = '50';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1498,9 +1498,27 @@ function renderDiag(segs) {
     : 'Aggancio alle strade disattivato.';
 }
 
+// Attività Garmin già caricate come bici ma a passo d'uomo: diventano a piedi
+async function upgradeGarmin() {
+  if (store.get('gaFix', '') === '1') return;
+  let changed = 0;
+  for (const r of await DB.all()) {
+    if (r.source !== 'garmin' || r.kind !== 'bicycle') continue;
+    const v = typicalKmh(r.segments.flat(), 5);
+    if (v === null || v >= BIKE_MIN_KMH) continue;
+    r.kind = 'walking';
+    r.segments = r.segments.map((seg) => seg.map((p) => [p[0], p[1], p[2], p[3], 'walking', p[5]]));
+    await DB.put(r);
+    changed++;
+  }
+  store.set('gaFix', '1');
+  if (changed) store.set('gaDirty', '1');
+}
+
 async function reloadFromDb(fit) {
   await loadElevations();
   await upgradeTimeline();
+  await upgradeGarmin();
   buildIndex(await DB.all());
   refreshYears();
   render(fit);
@@ -1659,10 +1677,32 @@ const FIT_VIRTUAL_MAKERS = new Set([89, 67, 260, 284, 281]);
 const isTapSync = (r, name) => (r.maker === 255 && r.product === 15706) || /tap-sync/i.test(name);
 const VIRTUAL_APP = /rouvy|zwift|tacx|bkool|kinomap|fulgaz|rgt|trainerroad|mywhoosh|systm|sufferfest|virtual|indoor/i;
 
+// Velocità tipica in movimento (km/h): quella registrata, altrimenti da distanza e tempo
+function typicalKmh(pts, spdIdx) {
+  const sp = [];
+  for (let i = 1; i < pts.length; i++) {
+    let v = pts[i][spdIdx];
+    if (v == null) {
+      const dt = (pts[i][2] - pts[i - 1][2]) / 1000;
+      if (!(dt > 0)) continue;
+      v = haversine(pts[i - 1], pts[i]) / dt;
+    }
+    v *= spdIdx === 4 ? 3.6 : 1; // nei FIT è in m/s, nelle tracce salvate già in km/h
+    if (v > 1) sp.push(v); // le soste non contano
+  }
+  sp.sort((a, b) => a - b);
+  return sp.length ? sp[sp.length >> 1] : null;
+}
+// Bici sotto questa velocità tipica: è un'escursione registrata col profilo bici (es. Sassopiatto 2015)
+const BIKE_MIN_KMH = 8;
+
 // Sport Garmin → categoria della heatmap
 function garminKind(sport, sub, pts) {
   if (FIT_INDOOR.has(sub)) return null;
-  if (sport === 2 || sport === 21) return 'bicycle'; // ciclismo (strada, MTB, gravel), e-bike
+  if (sport === 2 || sport === 21) { // ciclismo (strada, MTB, gravel), e-bike
+    const v = typicalKmh(pts, 4);
+    return v !== null && v < BIKE_MIN_KMH ? 'walking' : 'bicycle';
+  }
   if ([1, 11, 16, 17].includes(sport)) return 'walking'; // corsa, camminata, alpinismo, escursionismo
   if (sport === 0 || sport === null) {
     // "generico": decide la velocità tipica (a piedi sotto i 7 km/h)
