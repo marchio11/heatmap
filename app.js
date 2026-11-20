@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '39';
+const APP_VERSION = '40';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1170,6 +1170,48 @@ function elevationTargets() {
   return missing;
 }
 
+// Due servizi gratuiti, si passa all'altro se uno è al limite o non risponde:
+// - Open Topo Data (EU-DEM 25 m in Europa, SRTM 30 m altrove): 100 posizioni = 1 richiesta,
+//   max 1 al secondo e 1.000 al giorno (100.000 posizioni);
+// - Open-Meteo (Copernicus 90 m): ogni posizione conta, max 600 al minuto e 10.000 al giorno.
+const ELEV_SOURCES = [
+  {
+    name: 'otd', wait: 1100,
+    async get(pts) {
+      const url = 'https://api.opentopodata.org/v1/eudem25m,srtm30m?locations=' + pts.map((p) => p[0].toFixed(5) + ',' + p[1].toFixed(5)).join('|');
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('otd ' + res.status);
+      const json = await res.json();
+      if (json.status !== 'OK' || !Array.isArray(json.results)) throw new Error('otd');
+      return json.results.map((r) => r && r.elevation);
+    },
+  },
+  {
+    name: 'meteo', wait: 11000,
+    async get(pts) {
+      const url = 'https://api.open-meteo.com/v1/elevation?latitude=' + pts.map((p) => p[0].toFixed(5)).join(',') +
+        '&longitude=' + pts.map((p) => p[1].toFixed(5)).join(',');
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('meteo ' + res.status);
+      const json = await res.json();
+      if (!Array.isArray(json.elevation)) throw new Error('meteo');
+      return json.elevation;
+    },
+  },
+];
+const elevBlocked = {}; // servizio → ora fino a cui non riprovarlo
+async function fetchElevations(pts) {
+  for (const src of ELEV_SOURCES) {
+    if ((elevBlocked[src.name] || 0) > Date.now()) continue;
+    try {
+      return { values: await src.get(pts), wait: src.wait };
+    } catch {
+      elevBlocked[src.name] = Date.now() + 30 * 60_000; // al limite o non raggiungibile: si prova l'altro
+    }
+  }
+  throw new Error('quote non disponibili');
+}
+
 async function fillElevations() {
   if (elevBusy) return;
   elevBusy = true;
@@ -1181,16 +1223,11 @@ async function fillElevations() {
     if (!list.length) break;
     for (let i = 0; i < list.length; i += 100) {
       const batch = list.slice(i, i + 100);
-      const url = 'https://api.open-meteo.com/v1/elevation?latitude=' +
-        batch.map(([, p]) => p[0].toFixed(5)).join(',') + '&longitude=' +
-        batch.map(([, p]) => p[1].toFixed(5)).join(',');
       if (i === 0 && list.length > 300) keepAwake(true, 'elev');
-      const res = await fetch(url);
-      if (!res.ok) throw new Error('quote non disponibili');
-      const json = await res.json();
+      const { values, wait } = await fetchElevations(batch.map(([, p]) => p));
       const got = [];
       batch.forEach(([k], n) => {
-        const e = json.elevation && json.elevation[n];
+        const e = values[n];
         elevCache[k] = typeof e === 'number' && isFinite(e) ? Math.round(e) : -9999; // -9999: mare/sconosciuto
         got.push([k, elevCache[k]]);
       });
@@ -1198,8 +1235,7 @@ async function fillElevations() {
       doneLocs += batch.length;
       if (list.length > 300) setStatus(`Calcolo le quote… ${doneLocs} fatte, ${list.length - i - batch.length} ancora in questo giro`);
       if ((i / 100) % 10 === 9) renderRecords(); // il record si aggiorna strada facendo
-      // Open-Meteo gratuito: ogni posizione conta come una chiamata, max 600 al minuto
-      await sleep(11000);
+      await sleep(wait);
     }
     renderRecords();
     if (list.length > 300) setStatus('Quote calcolate: punto più alto aggiornato.');
@@ -1207,7 +1243,7 @@ async function fillElevations() {
   } catch {
     // limite del servizio (orario o giornaliero) o pagina sospesa: riprovo tra 10 minuti
     // (quello già fatto è salvato)
-    setStatus('Quote: limite del servizio gratuito raggiunto, riprendo da solo tra 10 minuti.');
+    setStatus('Quote: entrambi i servizi gratuiti sono al limite, riprendo da solo tra 10 minuti.');
     clearTimeout(elevRetry);
     elevRetry = setTimeout(fillElevations, 10 * 60_000);
   } finally {
