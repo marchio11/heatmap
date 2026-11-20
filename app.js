@@ -14,7 +14,7 @@ const CONFIG = {
 
 // Versione della lettura dei GPX: se cambia, i file vengono riletti da Drive
 const PARSE_VERSION = 7;
-const APP_VERSION = '55';
+const APP_VERSION = '56';
 // Heatlogger scrive nel GPX precisione, modo (act) e tipo di punto (kind)
 const HL_NS = 'https://github.com/marchio11/heatlogger/gpx/1';
 const MAX_ACC_M = 60;         // punti meno precisi di così non vengono disegnati
@@ -1502,6 +1502,17 @@ function renderDiag(segs) {
 // Attività Garmin già caricate come bici ma a passo d'uomo: diventano a piedi
 async function upgradeGarmin() {
   let changed = 0;
+  // 21/11: tracce semplificate (−80% di punti, stessa forma): più leggere da salvare su Drive e da disegnare
+  if (store.get('gaDP', '') !== '1') {
+    for (const r of await DB.all()) {
+      if (r.source !== 'garmin' || r.ver === 'g2') continue;
+      r.segments = r.segments.map((x) => simplifyTrack(x));
+      r.ver = 'g2';
+      await DB.put(r);
+      changed++;
+    }
+    store.set('gaDP', '1');
+  }
   // 21/11: la versione 50 calcolava in m/s invece che in km/h la velocità delle uscite senza velocità
   // registrata e le metteva "a piedi". Sopra i 15 km/h tipici non si cammina né si corre: tornano in bici.
   if (store.get('gaFix2', '') !== '1') {
@@ -1517,7 +1528,8 @@ async function upgradeGarmin() {
     store.set('gaFix2', '1');
     store.set('gaFix', ''); // e si rifà la correzione giusta (bici a passo d'uomo → a piedi)
   }
-  if (store.get('gaFix', '') === '1') { if (changed) store.set('gaDirty', '1'); return; }
+  if (changed) store.set('gaDirty', '1');
+  if (store.get('gaFix', '') === '1') return;
   for (const r of await DB.all()) {
     if (r.source !== 'garmin' || r.kind !== 'bicycle') continue;
     const v = typicalKmh(r.segments.flat(), 5);
@@ -1731,6 +1743,33 @@ function garminKind(sport, sub, pts) {
   return null; // nuoto, sci, palestra…
 }
 
+// Semplificazione (Douglas-Peucker): tiene solo i punti che servono perché la traccia non si sposti
+// di più di [tol] metri; il punto più alto resta sempre (record di quota)
+function simplifyTrack(pts, tol = 5) {
+  if (pts.length < 3) return pts;
+  const lat0 = pts[0][0] * Math.PI / 180, kx = 111320 * Math.cos(lat0), ky = 110540;
+  const xy = pts.map((p) => [p[1] * kx, p[0] * ky]);
+  const keep = new Uint8Array(pts.length);
+  keep[0] = keep[pts.length - 1] = 1;
+  let hi = -1;
+  pts.forEach((p, i) => { if (p[3] != null && (hi < 0 || p[3] > pts[hi][3])) hi = i; });
+  if (hi >= 0) keep[hi] = 1;
+  const stack = [[0, pts.length - 1]];
+  while (stack.length) {
+    const [a, b] = stack.pop();
+    const [ax, ay] = xy[a], [bx, by] = xy[b];
+    const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+    let worst = -1, wd = tol;
+    for (let i = a + 1; i < b; i++) {
+      const t = L ? Math.max(0, Math.min(1, ((xy[i][0] - ax) * dx + (xy[i][1] - ay) * dy) / L)) : 0;
+      const d = Math.hypot(xy[i][0] - ax - t * dx, xy[i][1] - ay - t * dy);
+      if (d > wd) { wd = d; worst = i; }
+    }
+    if (worst > 0) { keep[worst] = 1; stack.push([a, worst], [worst, b]); }
+  }
+  return pts.filter((_, i) => keep[i]);
+}
+
 // Le tracce Garmin hanno un punto al secondo: tengo un punto ogni 15 m (sulla mappa non cambia nulla)
 function thinTrack(pts, act) {
   const out = [];
@@ -1904,7 +1943,7 @@ async function importGarmin(files, collect = null) {
         segments[segments.length - 1].push(b);
       }
       if (collect) collect.push({ start: pts[0][2], kind, type: csvType, pts });
-      else await DB.put({ name: id, source: 'garmin', ver: 'g1', pv: PARSE_VERSION, kind, sport: r.sport, start: pts[0][2], end: pts[pts.length - 1][2], segments: segments.filter((x) => x.length >= 2) });
+      else await DB.put({ name: id, source: 'garmin', ver: 'g2', pv: PARSE_VERSION, kind, sport: r.sport, start: pts[0][2], end: pts[pts.length - 1][2], segments: segments.filter((x) => x.length >= 2).map((x) => simplifyTrack(x)) });
       kept++;
     } catch { skipped++; note('scartate', 'file illeggibile'); }
     if (read % 25 === 0) setStatus(`Garmin: lette ${read} attività, ${kept} con percorso all'aperto…`, false, true);
@@ -1933,7 +1972,7 @@ async function importGarmin(files, collect = null) {
     setStatus(`${csvTypes.size ? 'Strava' : 'Garmin'}: lette ${read} attività (${fmt(report.formati)}), nuove ${kept}. ` +
       `Bici per anno → ${fmt(report.bici)}. A piedi per anno → ${fmt(report.piedi)}. Scartate → ${fmt(report.scartate)}.`, false, true);
     $('garminReport').textContent = 'Ultimo caricamento Garmin: ' + $('status').textContent;
-    if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch(() => {});
+    if (kept && canUseAppData()) syncBundle(GARMIN_BUNDLE).catch((e) => setStatus(e.message + ': riprovo alla prossima sincronizzazione.', true));
   } catch (err) {
     if (collect) throw err;
     setStatus('Garmin: ' + err.message, true);
@@ -2192,7 +2231,7 @@ async function findTimelineFile() {
 
 // Pacchetti salvati su Drive: la Cronologia (ricostruita) e le attività Garmin
 const TL_BUNDLE = { src: 'timeline', file: TL_FILE, dirty: 'tlDirty', sync: 'tlSync', label: 'Cronologia' };
-const GARMIN_BUNDLE = { src: 'garmin', file: 'garmin.json.gz', dirty: 'gaDirty', sync: 'gaSync', label: 'attività Garmin' };
+const GARMIN_BUNDLE = { src: 'garmin', file: 'garmin.json.gz', dirty: 'gaDirty', sync: 'gaSync', label: 'attività Garmin e Strava' };
 
 async function syncTimeline(fromMatch = false) {
   if (matching && !fromMatch) return false;
@@ -2217,21 +2256,20 @@ async function syncBundle(B) {
     setStatus(`Salvo ${B.label} su Drive…`);
     const recs = local.map(({ name, ver, modifiedTime, pv, tlv, segments, match, kind, sport, start, end }) => ({ name, ver, modifiedTime, pv, tlv, segments, match, kind, sport, start, end }));
     const blob = await gzip(JSON.stringify({ v: 1, updated: new Date().toISOString(), records: recs }));
-    let res;
-    if (file) {
-      res = await drive('files/' + file.id, { uploadType: 'media', fields: 'id,modifiedTime' }, false,
-        { method: 'PATCH', headers: { 'Content-Type': 'application/gzip' }, body: blob }, up);
-    } else {
-      const boundary = 'heatmap' + Math.random().toString(36).slice(2);
-      const body = new Blob([
-        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
-        JSON.stringify({ name: B.file, parents: ['appDataFolder'] }) +
-        `\r\n--${boundary}\r\nContent-Type: application/gzip\r\n\r\n`, blob, `\r\n--${boundary}--`]);
-      res = await drive('files', { uploadType: 'multipart', fields: 'id,modifiedTime' }, false,
-        { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body }, up);
-    }
+    // Caricamento "a riprese" (resumable): quello semplice di Drive accetta al massimo 5 MB
+    // e le attività di Strava/Garmin sono molte di più (21/11: sul telefono non arrivavano)
+    const start = await fetch(`${up}files${file ? '/' + file.id : ''}?uploadType=resumable&fields=id,modifiedTime`, {
+      method: file ? 'PATCH' : 'POST',
+      headers: { Authorization: 'Bearer ' + token.value, 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': 'application/gzip', 'X-Upload-Content-Length': String(blob.size) },
+      body: JSON.stringify(file ? {} : { name: B.file, parents: ['appDataFolder'] }),
+    });
+    const loc = start.headers.get('Location');
+    if (!start.ok || !loc) throw new Error(`Salvataggio su Drive non riuscito (${start.status})`);
+    const put = await fetch(loc, { method: 'PUT', headers: { 'Content-Type': 'application/gzip' }, body: blob });
+    if (!put.ok) throw new Error(`Salvataggio su Drive non riuscito (${put.status})`);
+    const res = await put.json();
     store.set(B.sync, res.modifiedTime || ''); store.set(B.dirty, '0');
-    setStatus(`${B.label[0].toUpperCase() + B.label.slice(1)} salvata su Drive (${(blob.size / 1048576).toFixed(1)} MB): la ritrovi su ogni dispositivo.`);
+    setStatus(`${B.label[0].toUpperCase() + B.label.slice(1)} ${B.src === 'garmin' ? 'salvate' : 'salvata'} su Drive (${(blob.size / 1048576).toFixed(1)} MB): ${B.src === 'garmin' ? 'le' : 'la'} ritrovi su ogni dispositivo.`);
     return false;
   }
 
@@ -2314,7 +2352,7 @@ async function syncDrive() {
     try { await applyRemoteCache(); } catch { /* si aggancia da qui */ }
     let tlChanged = false;
     try { tlChanged = await syncTimeline(); } catch { /* riprova alla prossima sincronizzazione */ }
-    try { tlChanged = (await syncBundle(GARMIN_BUNDLE)) || tlChanged; } catch { /* riprova alla prossima sincronizzazione */ }
+    try { tlChanged = (await syncBundle(GARMIN_BUNDLE)) || tlChanged; } catch (e) { setStatus('Attività Garmin/Strava: ' + e.message, true, true); await sleep(4000); }
 
     await reloadFromDb(total > 0 || tlChanged);
     if (!tlChanged) setStatus(total
