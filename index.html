@@ -12,7 +12,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-  <link rel="stylesheet" href="style.css?v=56">
+  <link rel="stylesheet" href="style.css?v=57">
 </head>
 <body>
   <div id="map"></div>
@@ -46,34 +46,51 @@
 
       <details id="settings">
         <summary>Impostazioni</summary>
-        <div class="actions">
-          <button id="sync" class="primary">Accedi e sincronizza Drive</button>
-          <label class="btn">
-            Carica GPX, Cronologia Google (.json), Garmin o Strava (.zip)
-            <input id="fileInput" type="file" accept=".gpx,application/gpx+xml,.json,application/json,.zip,application/zip,.fit,.tcx" multiple hidden>
-          </label>
-        </div>
+        <button id="sync" class="primary">Accedi e sincronizza Drive</button>
 
-        <label class="row col">
-          <span>Cartella su Google Drive</span>
-          <input id="folder" type="text" placeholder="GPSLogger">
-        </label>
-        <button id="setHome">🏠 Imposta casa sulla mappa</button>
-        <label class="check">
-          <input id="snap" type="checkbox">
-          <span>Aggancia alle strade i percorsi in auto <small>(usa il server pubblico gratuito di OSRM)</small></span>
-        </label>
-        <button id="clearTimeline" class="danger" hidden>Rimuovi Cronologia Google</button>
-        <label class="btn">
-          Esporta attività Strava (JSON) <small>&nbsp;scegli lo ZIP di Strava</small>
-          <input id="exportInput" type="file" accept=".zip,application/zip" hidden>
-        </label>
-        <button id="clearGarmin" class="danger" hidden>Rimuovi attività Garmin</button>
-        <button id="clear" class="danger">Cancella i dati salvati nel browser</button>
-        <p id="diag" class="hint"></p>
-        <p id="garminReport" class="hint"></p>
-        <p class="hint">Versione app: <span id="ver"></span></p>
-        <p class="hint">I file GPX restano su Drive e nel tuo browser; la Cronologia Google caricata viene salvata, già ricostruita, nella cartella nascosta dell'app su Drive, così la ritrovi su ogni dispositivo. Se l'aggancio alle strade è attivo, solo coordinate e orari dei tratti in auto vengono inviati al server OSRM, senza nessun dato personale. Per il punto più alto le quote vengono lette dalle "tessere del terreno" pubbliche di AWS (o chieste a Open-Meteo), sempre in forma anonima.</p>
+        <details class="group">
+          <summary>📥 Importa ed esporta</summary>
+          <div class="actions">
+            <label class="btn">
+              Carica GPX, Cronologia Google (.json), Garmin o Strava (.zip)
+              <input id="fileInput" type="file" accept=".gpx,application/gpx+xml,.json,application/json,.zip,application/zip,.fit,.tcx" multiple hidden>
+            </label>
+            <label class="btn">
+              Esporta attività Strava (JSON) <small>&nbsp;scegli lo ZIP di Strava</small>
+              <input id="exportInput" type="file" accept=".zip,application/zip" hidden>
+            </label>
+          </div>
+          <p id="garminReport" class="hint"></p>
+        </details>
+
+        <details class="group">
+          <summary>🗺️ Mappa</summary>
+          <button id="setHome">🏠 Imposta casa sulla mappa</button>
+          <label class="check">
+            <input id="snap" type="checkbox">
+            <span>Aggancia alle strade i percorsi in auto <small>(usa il server pubblico gratuito di OSRM)</small></span>
+          </label>
+          <p id="diag" class="hint"></p>
+          <label class="row col">
+            <span>Cartella dei GPX su Google Drive</span>
+            <input id="folder" type="text" placeholder="GPSLogger">
+          </label>
+        </details>
+
+        <details class="group">
+          <summary>🗑️ Rimuovi dati</summary>
+          <div class="actions">
+            <button id="clearTimeline" class="danger" hidden>Rimuovi Cronologia Google</button>
+            <button id="clearGarmin" class="danger" hidden>Rimuovi attività Garmin e Strava</button>
+            <button id="clear" class="danger">Cancella i dati salvati nel browser</button>
+          </div>
+        </details>
+
+        <details class="group">
+          <summary>ℹ️ Informazioni</summary>
+          <p class="hint">Versione app: <span id="ver"></span></p>
+          <p class="hint">I file GPX restano su Drive e nel tuo browser; Cronologia Google e attività Garmin/Strava vengono salvate, già elaborate, nella cartella nascosta dell'app su Drive, così le ritrovi su ogni dispositivo. Se l'aggancio alle strade è attivo, solo coordinate e orari dei tratti in auto vengono inviati al server OSRM, senza nessun dato personale. Per il punto più alto le quote vengono lette dalle "tessere del terreno" pubbliche di AWS (o chieste a Open-Meteo), sempre in forma anonima.</p>
+        </details>
       </details>
     </div>
   </aside>
@@ -82,6 +99,6 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="app.js?v=56"></script>
+  <script src="app.js?v=57"></script>
 </body>
 </html>
